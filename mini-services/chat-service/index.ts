@@ -53,12 +53,12 @@ const httpServer = createServer((req, res) => {
 })
 
 const io = new Server(httpServer, {
-  // CRITICAL: path MUST be "/" so the Caddy gateway can route via
-  // XTransformPort=3003 query. Do NOT change this.
-  path: '/',
-  cors: { origin: '*', methods: ['GET', 'POST'] },
-  pingTimeout: 60000,
-  pingInterval: 25000,
+  cors: {
+    origin: process.env.NODE_ENV === "production"
+      ? ["https://twivter.vercel.app"]  // ganti URL Anda
+      : ["http://localhost:3000"],
+    methods: ["GET", "POST"]
+  }
 })
 
 const socketsByUser = new Map<string, Set<string>>() // userId → set of socketIds (multi-tab)
@@ -159,9 +159,9 @@ io.on('connection', (socket: Socket) => {
   })
 })
 
-const PORT = 3003
+const PORT = process.env.PORT || 3003
 httpServer.listen(PORT, () => {
-  console.log(`Twivter chat-service (socket.io) running on port ${PORT}`)
+  console.log(`💬 Twivter chat service listening on port ${PORT}`)
 })
 
 process.on('SIGTERM', () => {
