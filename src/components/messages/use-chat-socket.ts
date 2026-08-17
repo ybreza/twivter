@@ -35,8 +35,11 @@ interface UseChatSocketArgs {
 /**
  * Manages a single socket.io connection to the Twivter chat-service.
  *
- * Connection uses the gateway-safe URL `/?XTransformPort=3003` with
- * `path: '/'` — required for the Caddy gateway to forward to port 3003.
+ * In development: uses the gateway-safe URL `/?XTransformPort=3003` so the
+ * Caddy gateway forwards to port 3003. Socket.io uses default path `/socket.io`.
+ *
+ * In production: uses NEXT_PUBLIC_CHAT_URL env var (set on Vercel) pointing
+ * to the deployed chat service URL (e.g. https://twivter-chat.onrender.com).
  *
  * Exposes imperative helpers (sendMessage / sendTyping / markRead) so the
  * view can drive the realtime layer while persistence stays in the API.
@@ -59,8 +62,14 @@ export function useChatSocket({ userId, username, callbacks }: UseChatSocketArgs
   useEffect(() => {
     if (!userId || !username) return
 
-    const socket = io('/?XTransformPort=3003', {
-      path: '/',
+    // Production: NEXT_PUBLIC_CHAT_URL must be set on Vercel to the chat service URL.
+    // Development: use gateway path /?XTransformPort=3003 to reach local chat service.
+    const isProd = process.env.NODE_ENV === 'production'
+    const chatUrl = isProd && process.env.NEXT_PUBLIC_CHAT_URL
+      ? process.env.NEXT_PUBLIC_CHAT_URL
+      : '/?XTransformPort=3003'
+
+    const socket = io(chatUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionAttempts: Infinity,

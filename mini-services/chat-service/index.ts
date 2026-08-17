@@ -1,6 +1,6 @@
 // Twivter Chat Service — socket.io mini-service for realtime DM delivery.
-// Listens on port 3003. Path MUST stay "/" so Caddy can forward the request
-// from /?XTransformPort=3003 to this service.
+// Port: defaults to 3003 for local dev, uses process.env.PORT on cloud (Render/Railway/Fly).
+// CORS: in production, set CORS_ORIGINS env var (comma-separated) to your Vercel URLs.
 //
 // Responsibilities (stateless beyond the socket<->userId mapping):
 //   - On connect: emit `hello` so the client can confirm transport.
@@ -52,16 +52,19 @@ const httpServer = createServer((req, res) => {
   res.end('Twivter chat service is running. Connect via socket.io at /?XTransformPort=3003.')
 })
 
+// Build CORS origin list from env var (comma-separated) or fallback to localhost.
+// In production, set CORS_ORIGINS=https://yourapp.vercel.app,https://yourdomain.com
+const corsOrigins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
+  : ['http://localhost:3000']
+
 const io = new Server(httpServer, {
-  cors: {
-    origin: process.env.NODE_ENV === "production"
-      ? [
-          "https://twivter.vercel.app",  // ganti URL Vercel Anda
-          "https://twivter.vercel.app"        // dan domain custom kalau ada
-        ]
-      : ["http://localhost:3000"],
-    methods: ["GET", "POST"]
-  }
+  // Use default path '/socket.io' so /health endpoint is not intercepted.
+  // In dev, Caddy gateway still routes via XTransformPort query param correctly
+  // because it forwards the full path+query to localhost:3003.
+  cors: { origin: corsOrigins, methods: ['GET', 'POST'] },
+  pingTimeout: 60000,
+  pingInterval: 25000,
 })
 
 const socketsByUser = new Map<string, Set<string>>() // userId → set of socketIds (multi-tab)
@@ -162,9 +165,11 @@ io.on('connection', (socket: Socket) => {
   })
 })
 
-const PORT = process.env.PORT || 3003
+// Render/Railway/Fly provide PORT via env. Default to 3003 for local dev.
+const PORT = parseInt(process.env.PORT || '3003', 10)
 httpServer.listen(PORT, () => {
-  console.log(`💬 Twivter chat service listening on port ${PORT}`)
+  console.log(`Twivter chat-service (socket.io) running on port ${PORT}`)
+  console.log(`CORS origins: ${corsOrigins.join(', ')}`)
 })
 
 process.on('SIGTERM', () => {
