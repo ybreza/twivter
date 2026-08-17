@@ -55,7 +55,10 @@ const httpServer = createServer((req, res) => {
 const io = new Server(httpServer, {
   cors: {
     origin: process.env.NODE_ENV === "production"
-      ? ["https://twivter.vercel.app"]  // ganti URL Anda
+      ? [
+          "https://twivter.vercel.app",  // ganti URL Vercel Anda
+          "https://twivter.vercel.app"        // dan domain custom kalau ada
+        ]
       : ["http://localhost:3000"],
     methods: ["GET", "POST"]
   }
