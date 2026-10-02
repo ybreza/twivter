@@ -21,44 +21,14 @@ import { SettingsView } from '@/components/views/settings-view'
 import { AdminView } from '@/components/views/admin-view'
 import { ProfileView } from '@/components/views/profile-view'
 import { PostDetailView } from '@/components/views/post-detail-view'
+import { ViewUrlSync } from '@/components/views/view-url-sync'
 import { TrendingSidebar } from '@/components/layout/trending-sidebar'
 
 export default function Page() {
-  const user = useAuthStore((s) => s.user)
   const loading = useAuthStore((s) => s.loading)
-  const view = useViewStore((s) => s.view)
 
-  // If user becomes unauthenticated while in an app view, reset to landing
-  useEffect(() => {
-    if (!loading && !user) {
-      const current = useViewStore.getState().view
-      if (current !== 'landing' && current !== 'login' && current !== 'register') {
-        useViewStore.getState().navigate('landing')
-      }
-    }
-  }, [loading, user])
-
-  // ── Deep link: /?post=<id> ─────────────────────
-  // `PostCard`'s share button produces this URL. The SPA is the only reader of
-  // the router, so the param is consumed here — on mount and on popstate — and
-  // then stripped from the address bar.
-  useEffect(() => {
-    if (loading || !user) return
-
-    const openFromUrl = () => {
-      const id = new URLSearchParams(window.location.search).get('post')
-      if (!id) return
-      useViewStore.getState().navigate('post-detail', { postId: id })
-      const url = `${window.location.pathname}${window.location.hash}`
-      window.history.replaceState(null, '', url)
-    }
-
-    openFromUrl()
-    window.addEventListener('popstate', openFromUrl)
-    return () => window.removeEventListener('popstate', openFromUrl)
-  }, [loading, user])
-
-  // ── Loading state ─────────────────────────────
+  // The session check has to finish before the view store is trusted, otherwise
+  // the first paint can briefly show the app shell to a signed-out visitor.
   if (loading) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center gap-4 bg-background">
@@ -70,6 +40,37 @@ export default function Page() {
       </div>
     )
   }
+
+  // Mounting ViewUrlSync only after the session resolves keeps it out of the
+  // redirect-to-landing path below, so signing out does not fight the URL.
+  return <App />
+}
+
+function App() {
+  const user = useAuthStore((s) => s.user)
+  const loading = useAuthStore((s) => s.loading)
+
+  // If user becomes unauthenticated while in an app view, reset to landing
+  useEffect(() => {
+    if (!loading && !user) {
+      const current = useViewStore.getState().view
+      if (current !== 'landing' && current !== 'login' && current !== 'register') {
+        useViewStore.getState().navigate('landing')
+      }
+    }
+  }, [loading, user])
+
+  return (
+    <>
+      <ViewUrlSync />
+      <ViewContent />
+    </>
+  )
+}
+
+function ViewContent() {
+  const user = useAuthStore((s) => s.user)
+  const view = useViewStore((s) => s.view)
 
   // ── Unauthenticated flows ─────────────────────
   if (!user) {

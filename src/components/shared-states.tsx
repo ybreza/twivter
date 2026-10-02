@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { ArrowLeft, Loader2 } from 'lucide-react'
 import { useViewStore } from '@/stores/app-store'
+import { goBackInApp } from '@/lib/view-url'
 import { Skeleton } from '@/components/ui/skeleton'
 
 // Sticky header for views (Back button + title)
@@ -21,13 +22,20 @@ export function ViewHeader({
   rightSlot?: React.ReactNode
 }) {
   const navigate = useViewStore((s) => s.navigate)
-  const view = useViewStore((s) => s.view)
+
+  // Walks the real history when the app has entries of its own, so this button
+  // and the Android back button agree on where "back" is. Jumping straight to
+  // home here used to leave the tapped screen still in the history stack, so
+  // pressing back afterwards jumped *forward* into it again.
+  const onBack = () => {
+    if (!goBackInApp()) navigate('home')
+  }
   return (
     <header className="sticky top-0 z-30 bg-background/80 backdrop-blur-xl border-b border-border">
       <div className="flex items-center gap-4 px-4 h-14">
         {showBack && (
           <button
-            onClick={() => navigate('home')}
+            onClick={onBack}
             className="p-1.5 rounded-full hover:bg-muted transition-colors"
             aria-label="Kembali"
           >

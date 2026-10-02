@@ -13,6 +13,7 @@ import {
   BarChart3,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { hrefFor } from '@/lib/view-url'
 import { formatCount, timeAgo } from '@/lib/api'
 import { UserAvatar } from '@/components/user-avatar'
 import {
@@ -146,9 +147,14 @@ export function PostCard({ post, onReply, onDelete, variant = 'default' }: PostC
   }
 
   const share = async () => {
-    // Read back by `src/app/page.tsx`, which turns `?post=<id>` into a
-    // post-detail navigation and then cleans the query string.
-    const url = `${window.location.origin}/?post=${post.id}`
+    // Same encoding the app uses for its own history, so a shared link opens the
+    // post *and* still has a real entry to go back to. The legacy `?post=<id>`
+    // form is still accepted by `decodeView` for links shared earlier.
+    const url = `${window.location.origin}${hrefFor({
+      view: 'post-detail',
+      profileUsername: null,
+      postId: post.id,
+    })}`
     try {
       if (navigator.share) {
         await navigator.share({ title: 'Twivter Post', text: post.content.slice(0, 100), url })
