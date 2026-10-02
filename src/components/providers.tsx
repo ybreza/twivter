@@ -63,5 +63,20 @@ export function Providers({ children }: { children: React.ReactNode }) {
     }
   }, [setUser])
 
+  // Register the service worker. Chrome will not offer "Install app" without
+  // one, and iOS uses it for the offline shell. Registration is skipped in
+  // development: a cached shell would keep serving a stale build and mask edits.
+  useEffect(() => {
+    if (process.env.NODE_ENV !== 'production') return
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return
+    const register = () => {
+      navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {
+        /* offline support is a progressive enhancement; never block the app */
+      })
+    }
+    if (document.readyState === 'complete') register()
+    else window.addEventListener('load', register, { once: true })
+  }, [])
+
   return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
 }

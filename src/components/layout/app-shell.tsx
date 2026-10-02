@@ -113,7 +113,10 @@ export function AppShell({ children, rightSidebar }: { children: React.ReactNode
   return (
     <div className="min-h-screen flex flex-col bg-background">
       {/* ── Mobile Header ───────────────────────── */}
-      <header className="md:hidden sticky top-0 z-40 bg-background/80 backdrop-blur-xl border-b border-border">
+      {/* `safe-top`/`safe-bottom` keep the chrome clear of the notch and the
+          home indicator once the app runs in standalone mode. Both resolve to 0
+          padding on devices without a cutout. */}
+      <header className="md:hidden sticky top-0 z-40 bg-background/80 backdrop-blur-xl border-b border-border safe-top">
         <div className="flex items-center justify-between px-4 h-14">
           <button onClick={() => navigate('home')} className="flex items-center gap-2">
             <TwivterLogo size={28} />
@@ -274,7 +277,7 @@ export function AppShell({ children, rightSidebar }: { children: React.ReactNode
       </div>
 
       {/* ── Mobile bottom nav ───────────────────── */}
-      <nav className="md:hidden sticky bottom-0 z-40 bg-background/90 backdrop-blur-xl border-t border-border">
+      <nav className="md:hidden sticky bottom-0 z-40 bg-background/90 backdrop-blur-xl border-t border-border safe-bottom">
         <div className="grid grid-cols-5 h-14">
           <MobileNavBtn icon={Home} label="Home" active={view === 'home'} onClick={() => navigate('home')} />
           <MobileNavBtn icon={Compass} label="Explore" active={view === 'explore'} onClick={() => navigate('explore')} />

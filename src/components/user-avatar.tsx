@@ -61,7 +61,12 @@ export function UserAvatar({
   showVerified = true,
 }: UserAvatarProps) {
   return (
-    <div className={cn('relative inline-block shrink-0', className)}>
+    // `h-fit w-fit` matters: as a flex item the wrapper used to stretch to the
+    // full height of its row (a post author row is ~125px tall), and because the
+    // badge is positioned against the *wrapper*, not the avatar, it was anchored
+    // to the bottom of the row — roughly 87px below the avatar. The avatar is
+    // square and fixed-size, so the wrapper must hug it.
+    <div className={cn('relative inline-block h-fit w-fit shrink-0', className)}>
       <Avatar className={cn(sizeMap[size], 'ring-2 ring-background')}>
         {avatarUrl ? (
           <AvatarImage src={avatarUrl} alt={displayName} />

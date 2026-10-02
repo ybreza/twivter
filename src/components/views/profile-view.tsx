@@ -1,7 +1,6 @@
 'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
-import Link from 'next/link'
 import {
   CalendarDays,
   MapPin,
@@ -23,7 +22,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { PostCard } from '@/components/post/post-card'
 import { EditProfileDialog } from '@/components/profile/edit-profile-dialog'
 import { toast } from 'sonner'
-import { cn } from '@/lib/utils'
+import { cn, displayWebsite, normalizeWebsiteUrl } from '@/lib/utils'
 import { formatCount } from '@/lib/api'
 import type { ProfileDTO, PostDTO } from '@/lib/types'
 
@@ -166,6 +165,13 @@ export function ProfileView() {
     year: 'numeric',
   })
 
+  // Profiles created before the scheme rule still hold a bare domain. Rendering
+  // that through a next/link `<Link>` made the router treat it as a route of this
+  // app and prefetch `/twivter.com?_rsc=…`, which 404s. Normalising here means a
+  // legacy row produces a correct external link immediately, without a data
+  // migration, and `null` hides the row instead of linking to something broken.
+  const websiteHref = normalizeWebsiteUrl(profile.website)
+
   return (
     <div>
       <ViewHeader
@@ -285,17 +291,17 @@ export function ProfileView() {
               {profile.location}
             </span>
           )}
-          {profile.website && (
-            <Link
-              href={profile.website}
+          {websiteHref && (
+            <a
+              href={websiteHref}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-1 text-primary hover:underline"
               onClick={(e) => e.stopPropagation()}
             >
               <Link2 className="h-4 w-4" />
-              {profile.website.replace(/^https?:\/\//, '').replace(/\/$/, '')}
-            </Link>
+              {displayWebsite(profile.website)}
+            </a>
           )}
           <span className="flex items-center gap-1">
             <CalendarDays className="h-4 w-4" />

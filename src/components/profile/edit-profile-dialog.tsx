@@ -16,6 +16,7 @@ import { Loader2, Camera, Check, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/app-store'
 import { apiPatch } from '@/lib/hooks'
+import { normalizeWebsiteUrl } from '@/lib/utils'
 import { useImageUpload } from '@/hooks/use-image-upload'
 import type { ProfileDTO } from '@/lib/types'
 
@@ -143,7 +144,10 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
     replaceAvatarMedia([])
     await handleAvatarFiles(files)
     if (avatarUrlRef.current) {
-      toast.success('Foto profil diperbarui')
+      // Says "siap disimpan", not "diperbarui": nothing is persisted until
+      // "Simpan" is pressed, and the old wording made a discarded upload look
+      // like a successful profile change.
+      toast.success('Foto profil diunggah — klik Simpan untuk menyimpan')
     } else if (before) {
       // Upload rejected — put the previous preview back.
       replaceAvatarMedia([{ url: before, type: 'image' }])
@@ -158,7 +162,7 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
     replaceCoverMedia([])
     await handleCoverFiles(files)
     if (coverUrlRef.current) {
-      toast.success('Sampul diperbarui')
+      toast.success('Sampul diunggah — klik Simpan untuk menyimpan')
     } else if (before) {
       replaceCoverMedia([{ url: before, type: 'image' }])
     }
@@ -169,7 +173,12 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
     if (!displayName.trim()) return false
     if (usernameStatus === 'checking' || usernameStatus === 'taken' || usernameStatus === 'invalid') return false
     if (bio.length > 160) return false
-    if (website && !/^https?:\/\/.+/i.test(website)) return false
+    // A bare domain is fine — it is normalised to `https://` on save. This used
+    // to require an explicit scheme, which meant any profile whose website was
+    // stored without one could never be saved again: the button stayed disabled
+    // forever and every other edit in the form, including a freshly uploaded
+    // avatar, was silently thrown away.
+    if (website.trim() && !normalizeWebsiteUrl(website)) return false
     return true
   }
 
@@ -181,7 +190,7 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
         displayName: displayName.trim(),
         username: username.trim(),
         bio: bio.trim(),
-        website: website.trim(),
+        website: normalizeWebsiteUrl(website) ?? '',
         location: location.trim(),
         avatarUrl,
         coverUrl,
@@ -400,6 +409,13 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
                 onChange={(e) => setWebsite(e.target.value)}
                 placeholder="https://situsmu.com"
               />
+              {/* Explains *why* saving is blocked. Without this the form simply
+                  refused to save and the reason was invisible. */}
+              {website.trim() && !normalizeWebsiteUrl(website) && (
+                <p className="text-xs text-destructive">
+                  Website tidak valid — contoh: situsmu.com
+                </p>
+              )}
             </div>
           </div>
         </div>

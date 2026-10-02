@@ -7,9 +7,8 @@ import {
   type UpdateProfileInput,
 } from '@/lib/data/users'
 import { optNullableText, optSafeUrl, optTrimmed } from '@/lib/validate'
+import { normalizeWebsiteUrl } from '@/lib/utils'
 import type { ProfileDTO } from '@/lib/types'
-
-const HTTP_URL = /^https?:\/\/[^\s]+$/i
 
 /** Reloads the signed-in user's profile with fresh aggregates. */
 async function currentProfile(userId: string): Promise<ProfileDTO> {
@@ -64,11 +63,18 @@ export const PATCH = withErrorHandler(async (req) => {
   if (website !== undefined) {
     if (website !== null) {
       if (website.length > 200) throw badRequestError('Website URL terlalu panjang')
-      if (!HTTP_URL.test(website)) {
-        throw badRequestError('Website harus diawali http:// atau https://')
-      }
+      // Accepts a bare domain and adds `https://`. It used to be rejected with
+      // "Website harus diawali http:// atau https://", which was hostile: every
+      // profile created before the rule shipped stored a bare domain, so the
+      // edit form could never be saved again — the only fix was to retype the
+      // whole URL. Rejecting a value the user is allowed to see is a deadlock,
+      // not validation.
+      const normalized = normalizeWebsiteUrl(website)
+      if (!normalized) throw badRequestError('Website tidak valid')
+      updates.website = normalized
+    } else {
+      updates.website = null
     }
-    updates.website = website
   }
 
   const location = optNullableText(body.location, 'location')

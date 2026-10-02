@@ -27,6 +27,25 @@ database. `npm run deploy` produces one Worker.
 - Settings: account, theme (light/dark/system), interests, notification and
   privacy preferences
 - Search across posts, users and communities; trending hashtags
+- Installable: add-to-home-screen on Android and iOS, with an offline shell
+
+## Installing on a phone
+
+The app is a PWA, so it installs from the browser — no app store, no APK/IPA.
+
+**Android (Chrome):** open the site, then the ⋮ menu → *Install app* / *Add to
+Home screen*. Chrome only offers this once the service worker has registered, so
+give the page a moment on first load.
+
+**iOS (Safari):** open the site, then Share → *Add to Home Screen*. Safari
+ignores web app manifests, so this relies on the `apple-touch-icon` and
+`apple-mobile-web-app-capable` tags in `src/app/layout.tsx`, and it must be
+Safari rather than Chrome on iOS.
+
+Icons live in `public/icons/` and are generated rather than hand-drawn — run
+`node scripts/gen-icons.mjs` after changing the brand colours or the mark.
+`public/sw.js` precaches the app shell for offline launches and deliberately
+never caches `/api/*`, so a stale timeline or session can never be shown.
 
 ## Quick start
 
@@ -72,9 +91,13 @@ follows.
 ```
 migrations/            D1 schema migrations
 scripts/seed.mjs       demo data, applied via `wrangler d1 execute --file`
+scripts/gen-icons.mjs  generates the PWA icons in public/icons
+public/icons/          PWA icons (generated)
+public/sw.js           service worker: offline shell, caches no API responses
 src/cloudflare/        Durable Object (ChatUser)
 src/lib/               db client, auth, validation, storage, DTO builders
 src/lib/data/          repositories: posts, users, conversations, communities…
+src/app/manifest.ts    web app manifest
 src/app/api/           route handlers
 src/components/        SPA views (the app is a single `/` route)
 worker.ts              Worker entry: OpenNext handler + Durable Object
