@@ -271,50 +271,73 @@ check('GET /api/conversations returns 200', convs.status === 200 && Array.isArra
 const withUnread = (convs.body?.conversations ?? []).filter((c) => c.unreadCount > 0)
 console.log(`  INFO  ${convs.body?.conversations?.length ?? 0} conversations, ${withUnread.length} with unread`)
 
-// Send several messages from Sara so the unread badge must exceed 1.
-const privateConv = (convs.body?.conversations ?? []).find((c) => c.type === 'private')
-if (privateConv) {
+// Send several messages from a peer so the unread badge must exceed 1.
+//
+// Pick a private conversation whose peer is a seeded demo account we can
+// actually log in as. This used to take the first private conversation and
+// assume its peer's email was `<username>@twivter.com` — true only for seeded
+// users. On a database that also holds real signups the first peer is usually a
+// real account, so the suite failed with a misleading "peer login" error even
+// though the app was fine.
+const privateConvs = (convs.body?.conversations ?? []).filter((c) => c.type === 'private')
+let privateConv = null
+let peerSession = null
+for (const conv of privateConvs) {
   // `members` excludes the viewer, so members[0] is the other participant.
-  // Messages must be sent by a real member of this conversation.
-  const peer = privateConv.members[0]
-  const peerSession = new Session(`peer-${peer?.username}`)
-  const peerLogin = await peerSession.post('/api/auth/login', {
-    email: `${peer?.username}@twivter.com`,
+  const peer = conv.members[0]
+  if (!peer?.username) continue
+  const candidate = new Session(`peer-${peer.username}`)
+  const login = await candidate.post('/api/auth/login', {
+    email: `${peer.username}@twivter.com`,
     password: 'password123',
   })
-  if (peerLogin.status !== 200) {
-    check('peer login for the private conversation', false, `status=${peerLogin.status}`)
-  } else {
-    for (let i = 0; i < 3; i++) {
-      const sent = await peerSession.post(`/api/conversations/${privateConv.id}/messages`, {
-        content: `smoke ${i}`,
-      })
-      if (sent.status !== 200) {
-        check('send message', false, `status=${sent.status} ${JSON.stringify(sent.body).slice(0, 160)}`)
-        break
-      }
-    }
-    const after = await admin.get('/api/conversations')
-    const refreshed = (after.body?.conversations ?? []).find((c) => c.id === privateConv.id)
-    check(
-      'unreadCount is a real count (>1), not capped at 0 or 1',
-      (refreshed?.unreadCount ?? 0) > 1,
-      `unreadCount=${refreshed?.unreadCount}`,
-    )
-
-    const bogusCursor = await peerSession.get(
-      `/api/conversations/${privateConv.id}/messages?cursor=not-a-date`,
-    )
-    check('garbage message cursor is not a 500', bogusCursor.status !== 500, `status=${bogusCursor.status}`)
+  if (login.status === 200) {
+    privateConv = conv
+    peerSession = candidate
+    break
   }
+}
 
+// The membership checks below only need *a* private conversation.
+const accessConv = privateConv ?? privateConvs[0]
+
+if (privateConv) {
+  for (let i = 0; i < 3; i++) {
+    const sent = await peerSession.post(`/api/conversations/${privateConv.id}/messages`, {
+      content: `smoke ${i}`,
+    })
+    if (sent.status !== 200) {
+      check('send message', false, `status=${sent.status} ${JSON.stringify(sent.body).slice(0, 160)}`)
+      break
+    }
+  }
+  const after = await admin.get('/api/conversations')
+  const refreshed = (after.body?.conversations ?? []).find((c) => c.id === privateConv.id)
+  check(
+    'unreadCount is a real count (>1), not capped at 0 or 1',
+    (refreshed?.unreadCount ?? 0) > 1,
+    `unreadCount=${refreshed?.unreadCount}`,
+  )
+
+  const bogusCursor = await peerSession.get(
+    `/api/conversations/${privateConv.id}/messages?cursor=not-a-date`,
+  )
+  check('garbage message cursor is not a 500', bogusCursor.status !== 500, `status=${bogusCursor.status}`)
+} else {
+  console.log(
+    '  INFO  no seeded demo peer among private conversations; ' +
+      'skipping message-send, unread-count and cursor checks',
+  )
+}
+
+if (accessConv) {
   const outsider = new Session('outsider')
   await outsider.post('/api/auth/login', { email: 'dewi@twivter.com', password: 'password123' })
-  const peek = await outsider.get(`/api/conversations/${privateConv.id}`)
+  const peek = await outsider.get(`/api/conversations/${accessConv.id}`)
   check('non-member cannot read a conversation (403)', peek.status === 403, `status=${peek.status}`)
-  const peekMsgs = await outsider.get(`/api/conversations/${privateConv.id}/messages`)
+  const peekMsgs = await outsider.get(`/api/conversations/${accessConv.id}/messages`)
   check('non-member cannot read messages (403)', peekMsgs.status === 403, `status=${peekMsgs.status}`)
-  const peekSend = await outsider.post(`/api/conversations/${privateConv.id}/messages`, { content: 'x' })
+  const peekSend = await outsider.post(`/api/conversations/${accessConv.id}/messages`, { content: 'x' })
   check('non-member cannot post to a conversation (403)', peekSend.status === 403, `status=${peekSend.status}`)
 }
 
