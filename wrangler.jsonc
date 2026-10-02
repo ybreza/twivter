@@ -49,6 +49,16 @@
   "vars": {
     "NEXTJS_ENV": "production"
   },
+  // Custom domain. `custom_domain` makes Cloudflare create and manage the DNS
+  // record, which only works while the zone lives in this same account.
+  // `workers_dev` stays enabled so the *.workers.dev URL keeps working and the
+  // old hostname does not break while the certificate is still issuing.
+  "routes": [
+    {
+      "pattern": "twivter.lamuri.biz.id",
+      "custom_domain": true
+    }
+  ],
   "workers_dev": true,
   "preview_urls": false,
   "observability": {
