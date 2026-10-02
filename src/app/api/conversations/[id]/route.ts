@@ -1,24 +1,20 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
-import { getCurrentUser } from '@/lib/auth'
-import { unauthorized, notFound, forbidden, withErrorHandler, ok } from '@/lib/api'
-import { serializeConversation, CONVERSATION_INCLUDE } from '@/lib/serialize'
+import { notFoundError, ok, withErrorHandler } from '@/lib/api'
+import { requireUser } from '@/lib/auth'
+import { getConversation } from '@/lib/data/conversations'
 
-// GET /api/conversations/[id] — fetch a single conversation (must be a member).
-export const GET = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
-  const user = await getCurrentUser()
-  if (!user) return unauthorized()
-  const { id } = await ctx.params
+// GET /api/conversations/[id] — fetch a single conversation.
+// Returns { conversation: ConversationDTO }
+//
+// Membership is checked before the row is read, so a non-member gets 403 for a
+// conversation that exists and for one that does not — the endpoint cannot be
+// used to probe which ids are real.
+export const GET = withErrorHandler(async (req, ctx) => {
+  const user = await requireUser()
+  const params = await ctx.params
+  const raw = params.id
+  const conversationId = Array.isArray(raw) ? raw[0] : raw
+  if (!conversationId) throw notFoundError('Percakapan tidak ditemukan')
 
-  const conv = await db.conversation.findUnique({
-    where: { id },
-    include: CONVERSATION_INCLUDE,
-  })
-  if (!conv) return notFound('Percakapan tidak ditemukan')
-
-  const isMember = conv.members.some((m) => m.userId === user.id)
-  if (!isMember) return forbidden('Anda bukan anggota percakapan ini')
-
-  return ok({ conversation: await serializeConversation(conv, user.id) })
+  const conversation = await getConversation(conversationId, user.id)
+  return ok({ conversation })
 })
-// touched 1786945215

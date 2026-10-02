@@ -1,139 +1,246 @@
 'use client'
 
-import { useEffect, useRef, useState, useCallback } from 'react'
-import { io, Socket } from 'socket.io-client'
-import type { MessageDTO, AuthorDTO } from '@/lib/types'
+/**
+ * Realtime chat over a native WebSocket backed by a Cloudflare Durable Object.
+ *
+ * Replaces `socket.io-client`, which needed a separate Node service on port
+ * 3003 reachable through a Caddy gateway. The socket now lives inside the same
+ * Worker and is authenticated with the normal session cookie, so there is no
+ * extra deployment, no gateway rule and no second auth path.
+ *
+ * Messages are **sent over HTTP**, not over this socket: the server persists
+ * them and then pushes to the recipients. This keeps D1 as the single source of
+ * truth and means a dropped socket can never lose a message.
+ */
+import { useCallback, useEffect, useRef, useState } from 'react'
 
-// ── Socket payloads ─────────────────────────────
-export interface IncomingMessagePayload {
+export interface ChatMessageEvent {
+  type: 'message'
   conversationId: string
-  message: MessageDTO & { sender?: AuthorDTO }
+  message: unknown
   senderId: string
 }
 
-export interface TypingPayload {
+export interface ChatTypingEvent {
+  type: 'typing'
+  conversationId: string
+  userId: string
+  typing: boolean
+}
+
+export interface ChatReadEvent {
+  type: 'read'
   conversationId: string
   userId: string
 }
 
-export interface ReadPayload {
-  conversationId: string
+export type ChatEvent = ChatMessageEvent | ChatTypingEvent | ChatReadEvent
+
+export interface UseChatSocketOptions {
+  /** Set when the user is authenticated. The socket is only opened when set. */
+  userId: string | null
+  username: string
+  onMessage?: (event: ChatMessageEvent) => void
+  onTyping?: (event: ChatTypingEvent) => void
+  onRead?: (event: ChatReadEvent) => void
+  /** Called after the socket (re)connects, so the view can re-sync. */
+  onReconnect?: () => void
+  /**
+   * Invoked on a timer while the socket is unavailable.
+   *
+   * A Durable Object is not loaded by `next dev`, and some networks block
+   * WebSockets outright. Polling keeps the view correct in both cases instead of
+   * silently going stale. Omit to disable.
+   */
+  onFallbackPoll?: () => void
+  /** Poll interval used when the socket is down. Default 5000ms. */
+  fallbackPollMs?: number
 }
 
-export interface ChatSocketCallbacks {
-  onMessage?: (payload: IncomingMessagePayload) => void
-  onTyping?: (payload: TypingPayload & { isTyping: boolean }) => void
-  onRead?: (payload: ReadPayload) => void
-}
+const MAX_BACKOFF_MS = 15_000
+const BASE_BACKOFF_MS = 800
+/** Ping cadence; keeps intermediaries from dropping an idle socket. */
+const HEARTBEAT_MS = 25_000
 
-interface UseChatSocketArgs {
-  userId: string | null | undefined
-  username: string | null | undefined
-  callbacks: ChatSocketCallbacks
-}
-
-/**
- * Manages a single socket.io connection to the Twivter chat-service.
- *
- * In development: uses the gateway-safe URL `/?XTransformPort=3003` so the
- * Caddy gateway forwards to port 3003. Socket.io uses default path `/socket.io`.
- *
- * In production: uses NEXT_PUBLIC_CHAT_URL env var (set on Vercel) pointing
- * to the deployed chat service URL (e.g. https://twivter-chat.onrender.com).
- *
- * Exposes imperative helpers (sendMessage / sendTyping / markRead) so the
- * view can drive the realtime layer while persistence stays in the API.
- */
-export function useChatSocket({ userId, username, callbacks }: UseChatSocketArgs) {
-  const socketRef = useRef<Socket | null>(null)
-  const callbacksRef = useRef(callbacks)
-  const userIdRef = useRef<string | null>(userId ?? null)
-
-  // Keep refs in sync without touching them during render.
-  useEffect(() => {
-    callbacksRef.current = callbacks
-  }, [callbacks])
-  useEffect(() => {
-    userIdRef.current = userId ?? null
-  }, [userId])
+export function useChatSocket(options: UseChatSocketOptions) {
+  const {
+    userId,
+    username,
+    onMessage,
+    onTyping,
+    onRead,
+    onReconnect,
+    onFallbackPoll,
+    fallbackPollMs = 5000,
+  } = options
 
   const [connected, setConnected] = useState(false)
 
+  const socketRef = useRef<WebSocket | null>(null)
+  const attemptsRef = useRef(0)
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const closedRef = useRef(false)
+
+  // Callbacks are read through refs so changing them never tears down the socket.
+  // Assigned in an effect rather than during render: writing a ref while
+  // rendering is a side effect React may run more than once.
+  const handlersRef = useRef({ onMessage, onTyping, onRead, onReconnect, onFallbackPoll })
   useEffect(() => {
-    if (!userId || !username) return
+    handlersRef.current = { onMessage, onTyping, onRead, onReconnect, onFallbackPoll }
+  }, [onMessage, onTyping, onRead, onReconnect, onFallbackPoll])
 
-    // Production: NEXT_PUBLIC_CHAT_URL must be set on Vercel to the chat service URL.
-    // Development: use gateway path /?XTransformPort=3003 to reach local chat service.
-    const isProd = process.env.NODE_ENV === 'production'
-    const chatUrl = isProd && process.env.NEXT_PUBLIC_CHAT_URL
-      ? process.env.NEXT_PUBLIC_CHAT_URL
-      : '/?XTransformPort=3003'
-
-    const socket = io(chatUrl, {
-      transports: ['websocket', 'polling'],
-      reconnection: true,
-      reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      timeout: 10000,
-    })
-    socketRef.current = socket
-
-    const onConnect = () => {
-      setConnected(true)
-      socket.emit('auth', { userId, username })
+  const cleanup = useCallback(() => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
     }
-    const onDisconnect = () => setConnected(false)
-    const onMessage = (p: IncomingMessagePayload) => callbacksRef.current.onMessage?.(p)
-    const onTypingStart = (p: TypingPayload) =>
-      callbacksRef.current.onTyping?.({ ...p, isTyping: true })
-    const onTypingStop = (p: TypingPayload) =>
-      callbacksRef.current.onTyping?.({ ...p, isTyping: false })
-    const onRead = (p: ReadPayload) => callbacksRef.current.onRead?.(p)
-
-    socket.on('connect', onConnect)
-    socket.on('disconnect', onDisconnect)
-    socket.on('message:new', onMessage)
-    socket.on('typing:start', onTypingStart)
-    socket.on('typing:stop', onTypingStop)
-    socket.on('conversation:read', onRead)
-
-    return () => {
-      socket.off('connect', onConnect)
-      socket.off('disconnect', onDisconnect)
-      socket.off('message:new', onMessage)
-      socket.off('typing:start', onTypingStart)
-      socket.off('typing:stop', onTypingStop)
-      socket.off('conversation:read', onRead)
-      socket.disconnect()
-      socketRef.current = null
-      setConnected(false)
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current)
+      heartbeatRef.current = null
     }
-  }, [userId, username])
-
-  const sendMessage = useCallback(
-    (conversationId: string, message: MessageDTO, recipientIds: string[]) => {
-      if (!recipientIds.length) return
-      socketRef.current?.emit('message:send', { conversationId, message, recipientIds })
-    },
-    []
-  )
-
-  const sendTyping = useCallback(
-    (conversationId: string, recipientIds: string[], isTyping: boolean) => {
-      if (!recipientIds.length) return
-      const uid = userIdRef.current
-      if (!uid) return
-      const event = isTyping ? 'typing:start' : 'typing:stop'
-      socketRef.current?.emit(event, { conversationId, userId: uid, recipientIds })
-    },
-    []
-  )
-
-  const markRead = useCallback((conversationId: string, recipientIds: string[]) => {
-    if (!recipientIds.length) return
-    socketRef.current?.emit('conversation:read', { conversationId, recipientIds })
+    const socket = socketRef.current
+    socketRef.current = null
+    if (socket) {
+      // Detach first: a close() must not schedule another reconnect.
+      socket.onopen = null
+      socket.onclose = null
+      socket.onerror = null
+      socket.onmessage = null
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close()
+      }
+    }
+    setConnected(false)
   }, [])
 
-  return { connected, sendMessage, sendTyping, markRead }
+  useEffect(() => {
+    // When `userId` clears, React has already run this effect's previous cleanup,
+// which tore the socket down and reset `connected`. Calling `cleanup()` again
+// here would be a redundant synchronous setState during render.
+    if (!userId) return
+
+    closedRef.current = false
+
+    const connect = () => {
+      if (closedRef.current) return
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const socket = new WebSocket(`${protocol}//${window.location.host}/api/chat/socket`)
+      socketRef.current = socket
+
+      socket.onopen = () => {
+        if (closedRef.current) return
+        setConnected(true)
+        attemptsRef.current = 0
+        // A fresh connection may have missed events while it was down.
+        handlersRef.current.onReconnect?.()
+        heartbeatRef.current = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'ping' }))
+          }
+        }, HEARTBEAT_MS)
+      }
+
+      socket.onmessage = (event) => {
+        let data: ChatEvent
+        try {
+          data = JSON.parse(event.data as string) as ChatEvent
+        } catch {
+          return
+        }
+        switch (data.type) {
+          case 'message':
+            handlersRef.current.onMessage?.(data)
+            break
+          case 'typing':
+            handlersRef.current.onTyping?.(data)
+            break
+          case 'read':
+            handlersRef.current.onRead?.(data)
+            break
+          default:
+            break
+        }
+      }
+
+      socket.onerror = () => {
+        // `onclose` always follows, which is where reconnection is scheduled.
+      }
+
+      socket.onclose = () => {
+        if (heartbeatRef.current) {
+          clearInterval(heartbeatRef.current)
+          heartbeatRef.current = null
+        }
+        setConnected(false)
+        if (closedRef.current) return
+        // Exponential backoff with jitter, capped.
+        attemptsRef.current += 1
+        const delay = Math.min(BASE_BACKOFF_MS * 2 ** (attemptsRef.current - 1), MAX_BACKOFF_MS)
+        const jitter = Math.random() * 400
+        reconnectTimerRef.current = setTimeout(connect, delay + jitter)
+      }
+    }
+
+    connect()
+
+    // Pause reconnects while the tab is hidden; resume immediately when it returns.
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        const socket = socketRef.current
+        if (!socket || socket.readyState === WebSocket.CLOSED) {
+          attemptsRef.current = 0
+          if (reconnectTimerRef.current) {
+            clearTimeout(reconnectTimerRef.current)
+            reconnectTimerRef.current = null
+          }
+          connect()
+        }
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+
+    return () => {
+      closedRef.current = true
+      document.removeEventListener('visibilitychange', onVisibility)
+      cleanup()
+    }
+  }, [userId, username, cleanup])
+
+  /**
+   * Poll while the socket is down so the transcript still refreshes.
+   * Paused as soon as the socket is live, so the two mechanisms never double-fetch.
+   */
+  useEffect(() => {
+    if (!userId || connected || !onFallbackPoll || fallbackPollMs <= 0) return
+    const id = setInterval(() => {
+      handlersRef.current.onFallbackPoll?.()
+    }, fallbackPollMs)
+    return () => clearInterval(id)
+  }, [userId, connected, onFallbackPoll, fallbackPollMs])
+
+  /** Sends a typing indicator. Fire-and-forget; failures are non-fatal. */
+  const sendTyping = useCallback((conversationId: string, typing: boolean) => {
+    const socket = socketRef.current
+    if (socket?.readyState !== WebSocket.OPEN) return
+    try {
+      socket.send(JSON.stringify({ type: 'typing', conversationId, typing }))
+    } catch {
+      // Ignore: the indicator is cosmetic and self-corrects after 2s.
+    }
+  }, [])
+
+  /** Tells the conversation the user has read it. */
+  const markRead = useCallback((conversationId: string) => {
+    const socket = socketRef.current
+    if (socket?.readyState !== WebSocket.OPEN) return
+    try {
+      socket.send(JSON.stringify({ type: 'read', conversationId }))
+    } catch {
+      // Ignore.
+    }
+  }, [])
+
+  return { connected, sendTyping, markRead }
 }

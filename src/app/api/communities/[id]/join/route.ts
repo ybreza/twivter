@@ -1,66 +1,49 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
+import { badRequestError, notFoundError, ok, withErrorHandler } from '@/lib/api'
 import { requireUser } from '@/lib/auth'
-import { ok, badRequest, notFound, withErrorHandler } from '@/lib/api'
+import { getCommunity, joinCommunity, leaveCommunity } from '@/lib/data/communities'
 
-// POST /api/communities/[id]/join — join community
-export const POST = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+// POST /api/communities/[id]/join — join community (idempotent)
+// Returns { isMember: true, membersCount: number }
+//
+// The old handler was check-then-create with no database guarantee, so two
+// simultaneous taps raced into a unique violation and a 500. The join is now a
+// single `INSERT OR IGNORE` against a UNIQUE index, which cannot fail that way.
+//
+// DELETE /api/communities/[id]/join — leave community (owners cannot leave)
+// Returns { isMember: false, membersCount: number }
+export const POST = withErrorHandler(async (req, ctx) => {
   const user = await requireUser()
-  const { id } = await ctx.params
+  const params = await ctx.params
+  const raw = params.id
+  const idOrSlug = Array.isArray(raw) ? raw[0] : raw
+  if (!idOrSlug) throw notFoundError('Komunitas tidak ditemukan')
 
-  const community = await db.community.findFirst({
-    where: { OR: [{ id }, { slug: id }] },
-    select: { id: true },
-  })
-  if (!community) return notFound('Komunitas tidak ditemukan')
+  // The repository mutates by id, so a slug has to be resolved first. Throws
+  // 404 for an unknown community or slug.
+  const community = await getCommunity(idOrSlug, user.id)
 
-  const existing = await db.communityMember.findUnique({
-    where: { communityId_userId: { communityId: community.id, userId: user.id } },
-  })
-  if (!existing) {
-    await db.communityMember.create({
-      data: { communityId: community.id, userId: user.id, role: 'member' },
-    })
-  }
-
-  const membersCount = await db.communityMember.count({
-    where: { communityId: community.id },
-  })
-
-  return ok({ isMember: true, membersCount })
+  const result = await joinCommunity(community.id, user.id)
+  return ok(result)
 })
 
-// DELETE /api/communities/[id]/join — leave community (owners cannot leave)
-export const DELETE = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+export const DELETE = withErrorHandler(async (req, ctx) => {
   const user = await requireUser()
-  const { id } = await ctx.params
+  const params = await ctx.params
+  const raw = params.id
+  const idOrSlug = Array.isArray(raw) ? raw[0] : raw
+  if (!idOrSlug) throw notFoundError('Komunitas tidak ditemukan')
 
-  const community = await db.community.findFirst({
-    where: { OR: [{ id }, { slug: id }] },
-    select: { id: true },
-  })
-  if (!community) return notFound('Komunitas tidak ditemukan')
+  const community = await getCommunity(idOrSlug, user.id)
 
-  const membership = await db.communityMember.findUnique({
-    where: { communityId_userId: { communityId: community.id, userId: user.id } },
-  })
-  if (!membership) {
-    const membersCount = await db.communityMember.count({
-      where: { communityId: community.id },
-    })
-    return ok({ isMember: false, membersCount })
+  // Already not a member: idempotent, matching the old handler which returned
+  // `{ isMember: false }` instead of erroring.
+  if (!community.isMember) {
+    return ok({ isMember: false, membersCount: community.membersCount })
   }
-  if (membership.role === 'owner') {
-    return badRequest('Pemilik komunitas tidak dapat keluar. Transfer kepemilikan terlebih dahulu.')
+  if (community.role === 'owner') {
+    throw badRequestError('Pemilik komunitas tidak dapat keluar. Transfer kepemilikan terlebih dahulu.')
   }
 
-  await db.communityMember.delete({
-    where: { id: membership.id },
-  })
-
-  const membersCount = await db.communityMember.count({
-    where: { communityId: community.id },
-  })
-
-  return ok({ isMember: false, membersCount })
+  const result = await leaveCommunity(community.id, user.id)
+  return ok(result)
 })

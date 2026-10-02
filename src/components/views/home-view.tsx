@@ -37,6 +37,10 @@ export function HomeView() {
   // feed=explore for "For you" (chronological global), feed=home for "Following"
   const feedParam = tab === 'foryou' ? 'explore' : 'home'
 
+  // Set by the effect cleanup below so a slow response for the previous tab
+  // cannot land last and overwrite the feed the user is now looking at.
+  const ignoreRef = useRef(false)
+
   const fetchPage = useCallback(
     async (cursor: string | null, mode: 'initial' | 'more' | 'refresh') => {
       if (mode === 'initial') setLoadingInitial(true)
@@ -51,19 +55,23 @@ export function HomeView() {
           throw new Error(err.error || `HTTP ${res.status}`)
         }
         const data: FeedResponse = await res.json()
+        if (ignoreRef.current) return
         if (mode === 'more') {
-          setPosts((prev) => [...prev, ...data.posts])
+          setPosts((prev) => [...prev, ...(data.posts ?? [])])
         } else {
-          setPosts(data.posts)
+          setPosts(data.posts ?? [])
         }
-        setNextCursor(data.nextCursor)
+        setNextCursor(data.nextCursor ?? null)
       } catch (e: any) {
+        if (ignoreRef.current) return
         setError(e.message || 'Gagal memuat feed')
         if (mode === 'initial') toast.error('Gagal memuat feed')
       } finally {
-        setLoadingInitial(false)
-        setLoadingMore(false)
-        setRefreshing(false)
+        if (!ignoreRef.current) {
+          setLoadingInitial(false)
+          setLoadingMore(false)
+          setRefreshing(false)
+        }
       }
     },
     [feedParam]
@@ -71,7 +79,13 @@ export function HomeView() {
 
   // Refetch on tab change
   useEffect(() => {
-    fetchPage(null, 'initial')
+    ignoreRef.current = false
+    fetchPage(null, 'initial').catch(() => {
+      /* handled inside fetchPage */
+    })
+    return () => {
+      ignoreRef.current = true
+    }
   }, [fetchPage])
 
   // Infinite scroll

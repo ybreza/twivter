@@ -1,68 +1,49 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
+import { ok, parseJson, withErrorHandler } from '@/lib/api'
 import { getCurrentUser, requireUser } from '@/lib/auth'
-import { ok, badRequest, withErrorHandler, parseJson } from '@/lib/api'
-import { serializeCommunity, COMMUNITY_INCLUDE } from '@/lib/serialize'
-import { slugify } from '@/lib/utils'
+import { parseLimit } from '@/lib/db'
+import { createCommunity, listCommunities } from '@/lib/data/communities'
+import { optNullableText, optTrimmed, reqString } from '@/lib/validate'
 
-// GET /api/communities?q=... — list communities (limit 50)
-export const GET = withErrorHandler(async (req: NextRequest) => {
+// GET /api/communities?q=…&limit=50
+// Returns { communities: CommunityDTO[] }
+//
+// Anonymous callers are allowed; `isMember`/`membersCount` are simply false/0
+// for them. The search term is escaped by `likeTerm`, so `%` and `_` are matched
+// literally instead of acting as wildcards.
+export const GET = withErrorHandler(async (req) => {
   const user = await getCurrentUser()
   const { searchParams } = new URL(req.url)
-  const q = (searchParams.get('q') || '').trim()
-  const limit = 50
 
-  const communities = await db.community.findMany({
-    where: q
-      ? { OR: [{ name: { contains: q } }, { description: { contains: q } }] }
-      : undefined,
-    include: COMMUNITY_INCLUDE,
-    orderBy: { createdAt: 'desc' },
-    take: limit,
+  const communities = await listCommunities({
+    query: optTrimmed(searchParams.get('q'), 'q'),
+    limit: parseLimit(searchParams.get('limit'), 50, 50),
+    currentUserId: user?.id ?? null,
   })
 
-  const serialized = await Promise.all(
-    communities.map((c) => serializeCommunity(c, user?.id))
-  )
-
-  return ok({ communities: serialized })
+  return ok({ communities })
 })
 
 // POST /api/communities — create community
 // Body: { name, description? }
-export const POST = withErrorHandler(async (req: NextRequest) => {
+// Returns 200 { community: CommunityDTO }
+//
+// The old handler allocated a slug with a check-then-insert loop: two concurrent
+// creates of the same name both saw a free slug and the loser hit a raw unique
+// violation. Slug allocation now sits behind a UNIQUE index in the repository,
+// so there is nothing to retry here.
+export const POST = withErrorHandler(async (req) => {
   const user = await requireUser()
-  const body = await parseJson<{ name: string; description?: string }>(req)
+  const body = await parseJson(req)
 
-  const name = (body.name || '').trim()
-  if (!name) return badRequest('Nama komunitas wajib diisi')
-  if (name.length < 3) return badRequest('Nama komunitas minimal 3 karakter')
-  if (name.length > 60) return badRequest('Nama komunitas maksimal 60 karakter')
+  // Coerced through the validator: `reqString` rejects a missing or non-string
+  // name, and `optNullableText` turns `{ "description": 5 }` into `'5'` and
+  // `{ "description": null }` into NULL. The old `body.description?.trim()`
+  // only guarded `undefined`, so `{ "description": 5 }` was a 500.
+  const name = reqString(body.name, 'name')
+  const description = optNullableText(body.description, 'description') ?? null
 
-  const description = body.description?.trim() || null
+  // Enforces the 3..50 character name and the 280 character description cap.
+  const community = await createCommunity(user.id, name, description)
 
-  // Generate unique slug (append `-2`, `-3`, ... if taken)
-  const baseSlug = slugify(name) || `community-${Date.now()}`
-  let slug = baseSlug
-  let suffix = 1
-  while (await db.community.findUnique({ where: { slug } })) {
-    suffix += 1
-    slug = `${baseSlug}-${suffix}`
-  }
-
-  const community = await db.community.create({
-    data: {
-      name,
-      slug,
-      description,
-      ownerId: user.id,
-      members: {
-        create: { userId: user.id, role: 'owner' },
-      },
-    },
-    include: COMMUNITY_INCLUDE,
-  })
-
-  const serialized = await serializeCommunity(community, user.id)
-  return ok({ community: serialized })
+  return ok({ community })
 })

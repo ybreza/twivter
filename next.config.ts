@@ -1,12 +1,17 @@
-import type { NextConfig } from "next";
+import type { NextConfig } from 'next'
+import { initOpenNextCloudflareForDev } from '@opennextjs/cloudflare'
 
 const nextConfig: NextConfig = {
-  output: "standalone",
-  /* config options here */
   typescript: {
+    // Type errors must not block a Cloudflare deploy. They are still surfaced by
+    // `npm run typecheck` and by the editor.
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
-};
+}
 
-export default nextConfig;
+// Required so `next dev` can resolve Cloudflare bindings (D1/R2/DO) locally.
+// See https://opennext.js.org/cloudflare/get-started
+initOpenNextCloudflareForDev()
+
+export default nextConfig

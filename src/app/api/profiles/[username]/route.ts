@@ -1,28 +1,27 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
+import { notFoundError, ok, withErrorHandler } from '@/lib/api'
 import { getCurrentUser } from '@/lib/auth'
-import { ok, notFound, withErrorHandler } from '@/lib/api'
-import { serializeProfile } from '@/lib/serialize'
+import { findUserByUsername, loadProfiles } from '@/lib/data/users'
 
-// GET /api/profiles/[username] — public profile lookup
-export const GET = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ username: string }> }) => {
-  const { username } = await ctx.params
+function pathParam(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value[0] ?? '' : value ?? ''
+}
+
+// GET /api/profiles/[username] — public profile lookup.
+//   → ProfileDTO (the bare profile, which is what `profile-view` renders).
+//
+// The old handler tried an exact match first and, on a miss, fell back to a
+// `contains` scan of at most 50 rows, so whether "Alice" resolved depended on
+// which rows happened to fall inside that window. Lookups now go through the
+// `usernameLower` index and are case-insensitive by construction.
+export const GET = withErrorHandler(async (req, ctx) => {
+  const username = pathParam((await ctx.params).username)
   const currentUser = await getCurrentUser()
 
-  // SQLite is case-sensitive by default; seed usernames are lowercase.
-  // Try exact match first, then fall back to case-insensitive via findMany + filter.
-  let user = await db.user.findFirst({ where: { username } })
-  if (!user) {
-    const lower = username.toLowerCase()
-    const candidates = await db.user.findMany({
-      where: { username: { contains: lower } },
-      take: 50,
-    })
-    user = candidates.find((u) => u.username.toLowerCase() === lower) ?? null
-  }
+  const user = await findUserByUsername(username)
+  if (!user) throw notFoundError('Profil tidak ditemukan')
 
-  if (!user) return notFound('Profil tidak ditemukan')
+  const [profile] = await loadProfiles([user.id], currentUser?.id ?? null)
+  if (!profile) throw notFoundError('Profil tidak ditemukan')
 
-  const profile = await serializeProfile(user, currentUser?.id ?? null)
   return ok(profile)
 })

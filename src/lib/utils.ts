@@ -38,18 +38,6 @@ export function generateFileName(originalName: string, prefix = ''): string {
   return `${prefix}${timestamp}-${random}.${ext}`
 }
 
-// Validate image file
-export function validateImageFile(file: File, maxSizeMB: number): string | null {
-  const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
-  if (!allowed.includes(file.type)) {
-    return 'Format file harus JPEG, PNG, WEBP, atau GIF'
-  }
-  if (file.size > maxSizeMB * 1024 * 1024) {
-    return `Ukuran file maksimal ${maxSizeMB}MB`
-  }
-  return null
-}
-
 // Parse JSON safely
 export function safeJsonParse<T>(value: string | null | undefined, fallback: T): T {
   if (!value) return fallback

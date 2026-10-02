@@ -1,56 +1,56 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
 import { requireAdmin } from '@/lib/auth'
-import { ok, badRequest, notFound, withErrorHandler, parseJson } from '@/lib/api'
-import { serializeProfile } from '@/lib/serialize'
+import { badRequestError, notFoundError, ok, parseJson, withErrorHandler } from '@/lib/api'
+import { first } from '@/lib/db'
+import { optNullableText, optTrimmed } from '@/lib/validate'
+import { loadProfiles } from '@/lib/data/users'
+import { updateVerificationStatus } from '@/lib/data/moderation'
 
 // PATCH /api/admin/verifications/[id]
-// Body: { status: 'approved' | 'rejected' }
-// If approved: set the requesting user's `verified = true`.
+// Body: { status: 'approved' | 'rejected', note?: string | null }
+// Returns { request: { id, user, reason, status, createdAt, note } }
 //
-// Note: the Verification model has no `user` relation (just a `userId`
-// string field), so we fetch the user separately.
-export const PATCH = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
-  const admin = await requireAdmin()
-  const { id } = await ctx.params
-  if (!id) return notFound('Permintaan verifikasi tidak ditemukan')
+// Approving writes `User.verified = 1` and rejecting writes `0`, so rejecting a
+// previously approved request actually revokes the badge — the old handler only
+// ever wrote `verified = true`.
+export const PATCH = withErrorHandler(async (req, ctx) => {
+  await requireAdmin()
+  const raw = await ctx.params
+  const id = Array.isArray(raw.id) ? raw.id[0] : raw.id
+  if (!id) throw notFoundError('Permintaan verifikasi tidak ditemukan')
 
-  const body = await parseJson<{ status?: string }>(req)
-  const status = (body.status || '').trim()
+  const body = await parseJson(req)
+  // Coerced through the validator: the old code called `.trim()` on a raw body
+  // field, which threw a 500 for `null`/numeric bodies.
+  const status = optTrimmed(body.status, 'status')
   if (status !== 'approved' && status !== 'rejected') {
-    return badRequest('status harus salah satu dari: approved, rejected')
+    throw badRequestError('status harus salah satu dari: approved, rejected')
   }
+  const note = optNullableText(body.note, 'note') ?? null
 
-  const existing = await db.verification.findUnique({ where: { id } })
-  if (!existing) return notFound('Permintaan verifikasi tidak ditemukan')
+  const row = await first<{
+    id: string
+    userId: string
+    reason: string
+    createdAt: string
+  }>(`SELECT id, userId, reason, createdAt FROM Verification WHERE id = ?`, [id])
+  if (!row) throw notFoundError('Permintaan verifikasi tidak ditemukan')
 
-  const existingUser = await db.user.findUnique({ where: { id: existing.userId } })
-  if (!existingUser) return notFound('Pengguna peminta tidak ditemukan')
+  // Throws 404 when the request is gone, and always writes the matching
+  // `User.verified` value.
+  await updateVerificationStatus(id, status, note)
 
-  // Update verification status
-  const updated = await db.verification.update({
-    where: { id },
-    data: { status },
-  })
-
-  // If approved, mark the user as verified
-  let userRow = existingUser
-  if (status === 'approved') {
-    userRow = await db.user.update({
-      where: { id: existing.userId },
-      data: { verified: true },
-    })
-  }
-
-  const profile = await serializeProfile(userRow, admin.id)
+  // `user` is nullable by design: a request whose user row is missing must not
+  // crash the admin view.
+  const [profile] = await loadProfiles([row.userId])
 
   return ok({
     request: {
-      id: updated.id,
-      user: profile,
-      reason: updated.reason,
-      status: updated.status,
-      createdAt: updated.createdAt instanceof Date ? updated.createdAt.toISOString() : updated.createdAt,
+      id: row.id,
+      user: profile ?? null,
+      reason: row.reason,
+      status,
+      note,
+      createdAt: row.createdAt,
     },
   })
 })

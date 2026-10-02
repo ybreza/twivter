@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback, useSyncExternalStore } from 'react'
 import { toast } from 'sonner'
 import {
   User,
@@ -204,7 +204,12 @@ function AccountSection() {
     website !== (user?.website ?? '') ||
     location !== (user?.location ?? '')
 
-  const canSave = dirty && !usernameBlocked && displayName.trim().length > 0
+  // The API only accepts an http(s) website, so a bad URL used to save locally
+  // and then fail server-side after the click.
+  const websiteBlocked = website.trim().length > 0 && !/^https?:\/\/.+/i.test(website.trim())
+
+  const canSave =
+    dirty && !usernameBlocked && !websiteBlocked && displayName.trim().length > 0
 
   const handleSave = async () => {
     if (!user || !canSave) return
@@ -353,7 +358,7 @@ function AccountSection() {
             onChange={(e) => setWebsite(e.target.value)}
             placeholder="https://example.com"
           />
-          {website && !/^https?:\/\/.+/i.test(website) && (
+          {website && !/^https?:\/\/.+/i.test(website.trim()) && (
             <p className="text-xs text-destructive">
               Website harus diawali http:// atau https://
             </p>
@@ -577,40 +582,51 @@ function readLSBoolean(key: string, field: string, fallback: boolean): boolean {
   }
 }
 
-function NotificationsSection() {
-  const [emailNotif, setEmailNotif] = useState(() =>
-    readLSBoolean('twivter-notif-settings', 'emailNotif', true)
-  )
-  const [pushNotif, setPushNotif] = useState(() =>
-    readLSBoolean('twivter-notif-settings', 'pushNotif', true)
-  )
-  const [mentionAlerts, setMentionAlerts] = useState(() =>
-    readLSBoolean('twivter-notif-settings', 'mentionAlerts', true)
-  )
+// localStorage is an external store, so it is read through
+// `useSyncExternalStore`: the server snapshot is the fallback (which is what the
+// markup was rendered with, so there is no hydration mismatch) and the real
+// value is picked up right after hydration — no setState-in-effect cascade.
+const LS_LISTENERS = new Set<() => void>()
 
-  const persist = (next: {
-    emailNotif: boolean
-    pushNotif: boolean
-    mentionAlerts: boolean
-  }) => {
-    try {
-      localStorage.setItem('twivter-notif-settings', JSON.stringify(next))
-    } catch {
-      // ignore
-    }
+function persistLS(key: string, value: Record<string, boolean>) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    /* private mode / quota — the choice simply will not persist */
   }
+  LS_LISTENERS.forEach((listener) => listener())
+}
+
+function useLSBoolean(key: string, field: string, fallback: boolean): boolean {
+  const subscribe = useCallback((onChange: () => void) => {
+    LS_LISTENERS.add(onChange)
+    window.addEventListener('storage', onChange)
+    return () => {
+      LS_LISTENERS.delete(onChange)
+      window.removeEventListener('storage', onChange)
+    }
+  }, [])
+  const getSnapshot = useCallback(
+    () => readLSBoolean(key, field, fallback),
+    [key, field, fallback]
+  )
+  const getServerSnapshot = useCallback(() => fallback, [fallback])
+  return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
+}
+
+function NotificationsSection() {
+  const emailNotif = useLSBoolean('twivter-notif-settings', 'emailNotif', true)
+  const pushNotif = useLSBoolean('twivter-notif-settings', 'pushNotif', true)
+  const mentionAlerts = useLSBoolean('twivter-notif-settings', 'mentionAlerts', true)
 
   const onEmail = (v: boolean) => {
-    setEmailNotif(v)
-    persist({ emailNotif: v, pushNotif, mentionAlerts })
+    persistLS('twivter-notif-settings', { emailNotif: v, pushNotif, mentionAlerts })
   }
   const onPush = (v: boolean) => {
-    setPushNotif(v)
-    persist({ emailNotif, pushNotif: v, mentionAlerts })
+    persistLS('twivter-notif-settings', { emailNotif, pushNotif: v, mentionAlerts })
   }
   const onMention = (v: boolean) => {
-    setMentionAlerts(v)
-    persist({ emailNotif, pushNotif, mentionAlerts: v })
+    persistLS('twivter-notif-settings', { emailNotif, pushNotif, mentionAlerts: v })
   }
 
   return (
@@ -651,28 +667,14 @@ function NotificationsSection() {
 
 // ─── Privasi (Privacy) ────────────────────────────
 function PrivacySection() {
-  const [privateAccount, setPrivateAccount] = useState(() =>
-    readLSBoolean('twivter-privacy-settings', 'privateAccount', false)
-  )
-  const [showInSearch, setShowInSearch] = useState(() =>
-    readLSBoolean('twivter-privacy-settings', 'showInSearch', true)
-  )
-
-  const persist = (next: { privateAccount: boolean; showInSearch: boolean }) => {
-    try {
-      localStorage.setItem('twivter-privacy-settings', JSON.stringify(next))
-    } catch {
-      // ignore
-    }
-  }
+  const privateAccount = useLSBoolean('twivter-privacy-settings', 'privateAccount', false)
+  const showInSearch = useLSBoolean('twivter-privacy-settings', 'showInSearch', true)
 
   const onPrivate = (v: boolean) => {
-    setPrivateAccount(v)
-    persist({ privateAccount: v, showInSearch })
+    persistLS('twivter-privacy-settings', { privateAccount: v, showInSearch })
   }
   const onSearch = (v: boolean) => {
-    setShowInSearch(v)
-    persist({ privateAccount, showInSearch: v })
+    persistLS('twivter-privacy-settings', { privateAccount, showInSearch: v })
   }
 
   return (
@@ -811,7 +813,9 @@ function AboutSection() {
               </Badge>
             </div>
             <p className="text-sm text-muted-foreground mt-1">
-              Dibangun dengan Next.js 16, Prisma, dan socket.io.
+              Dibangun dengan Next.js 16 di atas Cloudflare Workers, memakai D1
+              untuk basis data, R2 untuk penyimpanan media, dan Durable Objects
+              untuk realtime chat.
             </p>
           </div>
         </div>

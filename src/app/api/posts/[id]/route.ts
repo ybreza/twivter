@@ -1,33 +1,48 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
+import { forbiddenError, notFoundError, ok, withErrorHandler } from '@/lib/api'
 import { getCurrentUser, requireUser } from '@/lib/auth'
-import { ok, notFound, forbidden, withErrorHandler } from '@/lib/api'
-import { serializePost, POST_INCLUDE } from '@/lib/serialize'
+import { first } from '@/lib/db'
+import { deletePostCascade, fetchPostPage } from '@/lib/data/posts'
+
+/**
+ * `withErrorHandler` types `ctx.params` values as `string | string[]`, which a
+ * single route segment never is. Normalise it once.
+ */
+function pathParam(value: string | string[] | undefined): string {
+  return (Array.isArray(value) ? value[0] : value) ?? ''
+}
 
 // GET /api/posts/[id] — single post
-export const GET = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+export const GET = withErrorHandler(async (req, ctx) => {
   const user = await getCurrentUser()
-  const { id } = await ctx.params
+  const id = pathParam((await ctx.params).id)
 
-  const post = await db.post.findUnique({
-    where: { id },
-    include: POST_INCLUDE,
+  // `nested` hydrates quotePost/replyTo, which the old POST_INCLUDE did.
+  const page = await fetchPostPage({
+    where: 'p.id = ?',
+    params: [id],
+    limit: 1,
+    currentUserId: user?.id ?? null,
+    nested: true,
   })
-  if (!post) return notFound('Post tidak ditemukan')
+  const post = page.posts[0]
+  if (!post) throw notFoundError('Post tidak ditemukan')
 
-  const serialized = await serializePost(post, user?.id)
-  return ok({ post: serialized })
+  return ok({ post })
 })
 
 // DELETE /api/posts/[id] — delete own post (cascades media/likes/etc)
-export const DELETE = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+export const DELETE = withErrorHandler(async (req, ctx) => {
   const user = await requireUser()
-  const { id } = await ctx.params
+  const id = pathParam((await ctx.params).id)
 
-  const post = await db.post.findUnique({ where: { id }, select: { authorId: true } })
-  if (!post) return notFound('Post tidak ditemukan')
-  if (post.authorId !== user.id) return forbidden('Anda tidak bisa menghapus post orang lain')
+  const row = await first<{ authorId: string }>(`SELECT authorId FROM Post WHERE id = ?`, [id])
+  if (!row) throw notFoundError('Post tidak ditemukan')
+  if (row.authorId !== user.id) {
+    throw forbiddenError('Anda tidak bisa menghapus post orang lain')
+  }
 
-  await db.post.delete({ where: { id } })
+  // Media, likes, bookmarks, reposts, replies, quotes and notifications all have
+  // ON DELETE CASCADE, so one statement removes the whole subtree.
+  await deletePostCascade(id)
   return ok({ success: true })
 })

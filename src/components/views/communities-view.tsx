@@ -320,7 +320,7 @@ function CommunityDetailBody({
   onMembershipChanged: (id: string, isMember: boolean, membersCount: number) => void
   onOpenChange: (open: boolean) => void
 }) {
-  const { navigate } = useViewStore()
+  const navigate = useViewStore((s) => s.navigate)
   const { data, loading, error, refetch } = useApi<CommunityDetailResponse>(
     `/api/communities/${communityId}`,
     {}
@@ -349,6 +349,8 @@ function CommunityDetailBody({
         setMembersCount(res.membersCount)
         onMembershipChanged(data.community.id, res.isMember, res.membersCount)
         toast.success(`Anda keluar dari ${data.community.name}`)
+        // Also refetch on leave, otherwise the member list still shows you.
+        refetch()
       } else {
         const res = await apiPost<{ isMember: boolean; membersCount: number }>(
           `/api/communities/${data.community.id}/join`

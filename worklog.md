@@ -1,5 +1,26 @@
 # Twivter — Worklog
 
+> **⚠️ Historical document — the architecture it describes no longer exists.**
+>
+> Everything below was written while the app ran on Next.js + **Prisma +
+> SQLite/PostgreSQL** with a separate **socket.io** service on port 3003 and
+> uploads written to `public/uploads` with `sharp`.
+>
+> All of that has been replaced:
+>
+> | Was | Now |
+> | --- | --- |
+> | Prisma + SQLite | Cloudflare D1, hand-written SQL (`src/lib/db.ts`, `src/lib/data/*`) |
+> | PostgreSQL option | removed |
+> | socket.io on port 3003 + Caddy | Durable Objects + WebSocket Hibernation (`src/cloudflare/chat-user.ts`) |
+> | `sharp` → local filesystem | client-side WebP conversion + Cloudflare R2 (`src/lib/image.ts`, `src/lib/storage.ts`) |
+> | Vercel / Render deploys | a single Cloudflare Worker (OpenNext) |
+> | `prisma/schema.prisma` | `migrations/0001_init.sql` |
+>
+> For the current architecture see [README.md](README.md),
+> [docs/DEPLOY.md](docs/DEPLOY.md) and [docs/DATA-LAYER.md](docs/DATA-LAYER.md).
+> The entries below are kept only as a record of what was built and when.
+
 Project: Social media platform (Twitter/X-style) built with Next.js 16 + Prisma (SQLite) + socket.io.
 PRD: `/home/z/my-project/upload/PRD_Twivter.md`
 

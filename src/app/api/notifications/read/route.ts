@@ -1,31 +1,26 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
+import { ok, parseJson, withErrorHandler } from '@/lib/api'
 import { requireUser } from '@/lib/auth'
-import { ok, badRequest, withErrorHandler, parseJson } from '@/lib/api'
+import { markAllNotificationsRead, markNotificationRead } from '@/lib/data/notifications'
+import { optTrimmed } from '@/lib/validate'
 
 // POST /api/notifications/read
-// Body: { id?: string } — if id provided, mark that one read; else mark all read.
-export const POST = withErrorHandler(async (req: NextRequest) => {
+// Body: { id? } — with `id`, mark that one read; without it, mark all read.
+// Returns { success: true }
+//
+// Ownership is enforced in the repository and both "no such notification" and
+// "someone else's notification" are 404. The old handler answered 400 for the
+// first and 400 with a different message for the second, which both leaked
+// existence and told a legitimate owner their own id was malformed.
+export const POST = withErrorHandler(async (req) => {
   const user = await requireUser()
-  const body = await parseJson<{ id?: string }>(req)
+  const body = await parseJson(req)
 
-  if (body.id) {
-    // Verify ownership before updating
-    const notif = await db.notification.findUnique({
-      where: { id: body.id },
-      select: { userId: true },
-    })
-    if (!notif) return badRequest('Notifikasi tidak ditemukan')
-    if (notif.userId !== user.id) return badRequest('Tidak diizinkan')
-    await db.notification.update({
-      where: { id: body.id },
-      data: { read: true },
-    })
+  // Coerced, never `.trim()`ed raw — `body.id` used to reach the ORM unchecked.
+  const id = optTrimmed(body.id, 'id')
+  if (id !== undefined) {
+    await markNotificationRead(id, user.id)
   } else {
-    await db.notification.updateMany({
-      where: { userId: user.id, read: false },
-      data: { read: true },
-    })
+    await markAllNotificationsRead(user.id)
   }
 
   return ok({ success: true })

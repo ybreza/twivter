@@ -1,83 +1,106 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
+import { badRequestError, ok, withErrorHandler } from '@/lib/api'
 import { getCurrentUser } from '@/lib/auth'
-import { ok, notFound, badRequest, withErrorHandler } from '@/lib/api'
-import { serializePost, POST_INCLUDE } from '@/lib/serialize'
+import { all, parseLimit, type BindValue } from '@/lib/db'
+import { fetchPostPage, fetchPostsByIds } from '@/lib/data/posts'
+import { requireUserByUsername } from '@/lib/data/users'
+import type { PostDTO } from '@/lib/types'
+
+const TABS = ['posts', 'replies', 'media', 'likes'] as const
+type Tab = (typeof TABS)[number]
+
+function pathParam(value: string | string[] | undefined): string {
+  return (Array.isArray(value) ? value[0] : value) ?? ''
+}
+
+/** Hydrates `quotePost`/`replyTo` one level deep, like the feed repository does. */
+async function hydrateNested(posts: PostDTO[], currentUserId: string | null): Promise<void> {
+  const nestedIds = [
+    ...new Set(posts.flatMap((p) => [p.quotePostId, p.replyToId].filter(Boolean) as string[])),
+  ]
+  if (nestedIds.length === 0) return
+  const nested = await fetchPostsByIds(nestedIds, currentUserId)
+  for (const post of posts) {
+    if (post.quotePostId) post.quotePost = nested.get(post.quotePostId) ?? null
+    if (post.replyToId) post.replyTo = nested.get(post.replyToId) ?? null
+  }
+}
+
+/**
+ * The "likes" tab: posts the profile owner has liked, newest like first.
+ *
+ * Paginated on the `Like` row's own id — the old handler used
+ * `cursor: { id }` with `orderBy: { createdAt }`, which skipped and repeated
+ * rows, then re-fetched the posts with an unordered `findMany`.
+ */
+async function fetchLikedPosts(
+  ownerId: string,
+  limit: number,
+  cursor: string | null,
+  currentUserId: string | null,
+): Promise<{ posts: PostDTO[]; nextCursor: string | null }> {
+  const rows = await all<{ id: string; postId: string }>(
+    `SELECT id, postId
+       FROM Like
+      WHERE userId = ?${cursor ? ' AND id < ?' : ''}
+      ORDER BY id DESC
+      LIMIT ?`,
+    [...(cursor ? [ownerId, cursor] : [ownerId]), limit + 1] as BindValue[],
+  )
+
+  const hasMore = rows.length > limit
+  const page = hasMore ? rows.slice(0, limit) : rows
+  if (page.length === 0) return { posts: [], nextCursor: null }
+
+  const byId = await fetchPostsByIds(
+    page.map((row) => row.postId),
+    currentUserId,
+  )
+  const posts: PostDTO[] = []
+  for (const row of page) {
+    const post = byId.get(row.postId)
+    if (post) posts.push(post)
+  }
+  await hydrateNested(posts, currentUserId)
+
+  return { posts, nextCursor: hasMore ? (page[page.length - 1]?.id ?? null) : null }
+}
 
 // GET /api/profiles/[username]/posts?tab=posts|replies|media|likes&cursor=<id>&limit=20
-export const GET = withErrorHandler(
-  async (req: NextRequest, ctx: { params: Promise<{ username: string }> }) => {
-    const { username } = await ctx.params
-    const currentUser = await getCurrentUser()
-    const { searchParams } = new URL(req.url)
-    const tab = (searchParams.get('tab') || 'posts') as 'posts' | 'replies' | 'media' | 'likes'
-    const limit = Math.min(parseInt(searchParams.get('limit') || '20'), 50)
-    const cursor = searchParams.get('cursor') || undefined
+export const GET = withErrorHandler(async (req, ctx) => {
+  const username = pathParam((await ctx.params).username)
+  const viewer = await getCurrentUser()
+  const { searchParams } = new URL(req.url)
 
-    // Lookup target user (case-insensitive fallback)
-    let user = await db.user.findFirst({ where: { username } })
-    if (!user) {
-      const lower = username.toLowerCase()
-      const candidates = await db.user.findMany({
-        where: { username: { contains: lower } },
-        take: 50,
-      })
-      user = candidates.find((u) => u.username.toLowerCase() === lower) ?? null
-    }
-    if (!user) return notFound('Pengguna tidak ditemukan')
+  const rawTab = searchParams.get('tab') || 'posts'
+  if (!(TABS as readonly string[]).includes(rawTab)) throw badRequestError('Tab tidak valid')
+  const tab = rawTab as Tab
+  const limit = parseLimit(searchParams.get('limit'), 20, 50)
+  const cursor = searchParams.get('cursor')
 
-    // Build the where clause for each tab
-    let where: any
-    let include = POST_INCLUDE
+  // Case-insensitive lookup; throws 404 when the username is unknown.
+  const profile = await requireUserByUsername(username)
 
-    if (tab === 'posts') {
-      where = { authorId: user.id, replyToId: null }
-    } else if (tab === 'replies') {
-      where = { authorId: user.id, replyToId: { not: null } }
-    } else if (tab === 'media') {
-      where = { authorId: user.id, media: { some: {} } }
-    } else if (tab === 'likes') {
-      // Posts the user has liked — join via Like table.
-      const likes = await db.like.findMany({
-        where: { userId: user.id },
-        select: { id: true, postId: true },
-        orderBy: { createdAt: 'desc' },
-        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-        take: limit + 1,
-      })
-      const hasMore = likes.length > limit
-      const items = hasMore ? likes.slice(0, limit) : likes
-      const posts = await db.post.findMany({
-        where: { id: { in: items.map((l) => l.postId) } },
-        include: POST_INCLUDE,
-      })
-      // preserve like order
-      const order = new Map(items.map((l, i) => [l.postId, i]))
-      posts.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
-      const serialized = await Promise.all(posts.map((p) => serializePost(p, currentUser?.id ?? null)))
-      return ok({
-        posts: serialized,
-        nextCursor: hasMore ? items[items.length - 1].id : null,
-      })
-    } else {
-      return badRequest('Tab tidak valid')
-    }
-
-    const posts = await db.post.findMany({
-      where,
-      include,
-      orderBy: { createdAt: 'desc' },
-      take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-    })
-
-    const hasMore = posts.length > limit
-    const items = hasMore ? posts.slice(0, limit) : posts
-    const serialized = await Promise.all(items.map((p) => serializePost(p, currentUser?.id ?? null)))
-
-    return ok({
-      posts: serialized,
-      nextCursor: hasMore ? items[items.length - 1].id : null,
-    })
+  if (tab === 'likes') {
+    return ok(await fetchLikedPosts(profile.id, limit, cursor, viewer?.id ?? null))
   }
-)
+
+  const where =
+    tab === 'posts'
+      ? 'p.authorId = ? AND p.replyToId IS NULL'
+      : tab === 'replies'
+        ? 'p.authorId = ? AND p.replyToId IS NOT NULL'
+        : // media: has at least one PostMedia row
+          'p.authorId = ? AND EXISTS (SELECT 1 FROM PostMedia m WHERE m.postId = p.id)'
+
+  const page = await fetchPostPage({
+    where,
+    params: [profile.id],
+    limit,
+    cursor,
+    order: 'desc',
+    currentUserId: viewer?.id ?? null,
+    nested: true,
+  })
+
+  return ok(page)
+})

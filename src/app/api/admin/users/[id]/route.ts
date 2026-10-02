@@ -1,48 +1,38 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
 import { requireAdmin } from '@/lib/auth'
-import { ok, badRequest, notFound, withErrorHandler, parseJson } from '@/lib/api'
-import { serializeProfile } from '@/lib/serialize'
+import { badRequestError, notFoundError, ok, parseJson, withErrorHandler } from '@/lib/api'
+import { optBool, optTrimmed } from '@/lib/validate'
+import { loadProfiles } from '@/lib/data/users'
+import { setUserRole, setUserVerified } from '@/lib/data/moderation'
 
 // PATCH /api/admin/users/[id]
 // Body: { role?: 'user'|'admin', verified?: boolean }
-// Returns the updated ProfileDTO.
-export const PATCH = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+// Returns the updated ProfileDTO directly (this route is not nested under a key).
+export const PATCH = withErrorHandler(async (req, ctx) => {
   const admin = await requireAdmin()
-  const { id } = await ctx.params
-  if (!id) return notFound('Pengguna tidak ditemukan')
+  const raw = await ctx.params
+  const id = Array.isArray(raw.id) ? raw.id[0] : raw.id
+  if (!id) throw notFoundError('Pengguna tidak ditemukan')
 
-  const body = await parseJson<{ role?: string; verified?: boolean }>(req)
+  const body = await parseJson(req)
+  const role = optTrimmed(body.role, 'role')
+  const verified = optBool(body.verified, 'verified')
 
-  const updates: Record<string, unknown> = {}
-
-  if (body.role !== undefined) {
-    if (body.role !== 'user' && body.role !== 'admin') {
-      return badRequest('role harus salah satu dari: user, admin')
-    }
-    // Safety: prevent admin from demoting themselves (would lock themselves out)
-    if (body.role !== 'admin' && id === admin.id) {
-      return badRequest('Kamu tidak dapat menurunkan role-mu sendiri')
-    }
-    updates.role = body.role
+  if (role === undefined && verified === undefined) {
+    throw badRequestError('Tidak ada perubahan untuk disimpan')
+  }
+  if (role !== undefined && role !== 'user' && role !== 'admin') {
+    throw badRequestError('role harus salah satu dari: user, admin')
   }
 
-  if (body.verified !== undefined) {
-    updates.verified = !!body.verified
-  }
+  // Both helpers throw 404 when the target does not exist, and `setUserRole`
+  // refuses to let an admin demote themselves.
+  if (role !== undefined) await setUserRole(admin.id, id, role)
+  if (verified !== undefined) await setUserVerified(admin.id, id, verified)
 
-  if (Object.keys(updates).length === 0) {
-    return badRequest('Tidak ada perubahan untuk disimpan')
-  }
+  // Re-read through the shared loader so the response always carries fresh
+  // counts and flags.
+  const [profile] = await loadProfiles([id])
+  if (!profile) throw notFoundError('Pengguna tidak ditemukan')
 
-  const existing = await db.user.findUnique({ where: { id }, select: { id: true } })
-  if (!existing) return notFound('Pengguna tidak ditemukan')
-
-  const updated = await db.user.update({
-    where: { id },
-    data: updates,
-  })
-
-  const profile = await serializeProfile(updated, admin.id)
   return ok(profile)
 })

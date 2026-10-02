@@ -1,47 +1,29 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
 import { requireAdmin } from '@/lib/auth'
-import { ok, badRequest, notFound, withErrorHandler, parseJson } from '@/lib/api'
+import { badRequestError, notFoundError, ok, parseJson, withErrorHandler } from '@/lib/api'
+import { optTrimmed } from '@/lib/validate'
+import { updateReportStatus, type ReportStatus } from '@/lib/data/moderation'
+
+const ALLOWED: readonly ReportStatus[] = ['reviewed', 'resolved', 'dismissed']
 
 // PATCH /api/admin/reports/[id] — update report status
 // Body: { status: 'reviewed' | 'resolved' | 'dismissed' }
-export const PATCH = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+// Returns the updated AdminReport under `report`.
+export const PATCH = withErrorHandler(async (req, ctx) => {
   await requireAdmin()
-  const { id } = await ctx.params
-  if (!id) return notFound('Laporan tidak ditemukan')
+  const raw = await ctx.params
+  const id = Array.isArray(raw.id) ? raw.id[0] : raw.id
+  if (!id) throw notFoundError('Laporan tidak ditemukan')
 
-  const body = await parseJson<{ status?: string }>(req)
-  const status = (body.status || '').trim()
-  const allowed = ['reviewed', 'resolved', 'dismissed']
-  if (!allowed.includes(status)) {
-    return badRequest('status harus salah satu dari: reviewed, resolved, dismissed')
+  const body = await parseJson(req)
+  // Coerced through the validator: the old code called `.trim()` on a raw body
+  // field, which threw a 500 for `null`/numeric bodies.
+  const status = optTrimmed(body.status, 'status')
+  if (!status || !ALLOWED.includes(status as ReportStatus)) {
+    throw badRequestError('status harus salah satu dari: reviewed, resolved, dismissed')
   }
 
-  const existing = await db.report.findUnique({ where: { id }, select: { id: true } })
-  if (!existing) return notFound('Laporan tidak ditemukan')
+  // Throws 404 when the report does not exist.
+  const report = await updateReportStatus(id, status as ReportStatus)
 
-  const updated = await db.report.update({
-    where: { id },
-    data: { status },
-    include: {
-      reporter: {
-        select: { id: true, username: true, displayName: true, avatarUrl: true, verified: true },
-      },
-      target: {
-        select: { id: true, username: true, displayName: true, avatarUrl: true, verified: true },
-      },
-    },
-  })
-
-  return ok({
-    report: {
-      id: updated.id,
-      reporter: updated.reporter,
-      target: updated.target,
-      targetType: updated.targetType,
-      reason: updated.reason,
-      status: updated.status,
-      createdAt: updated.createdAt instanceof Date ? updated.createdAt.toISOString() : updated.createdAt,
-    },
-  })
+  return ok({ report })
 })

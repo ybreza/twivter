@@ -1,85 +1,89 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
+import { badRequestError, notFoundError, ok, parseJson, withErrorHandler } from '@/lib/api'
 import { requireUser } from '@/lib/auth'
+import { createNotification } from '@/lib/data/notifications'
 import {
-  ok,
-  badRequest,
-  notFound,
-  conflict,
-  withErrorHandler,
-  parseJson,
-} from '@/lib/api'
+  findUserById,
+  findUserByUsername,
+  followersCount,
+  followUser,
+  unfollowUser,
+} from '@/lib/data/users'
+import type { ProfileRow } from '@/lib/serialize'
+import { assertId, optString } from '@/lib/validate'
 
-type FollowBody = { targetUserId?: string; username?: string }
+interface FollowTarget {
+  targetUserId?: unknown
+  username?: unknown
+}
 
-// Resolve target user from either `targetUserId` or `username`
-async function resolveTarget(body: FollowBody) {
-  if (body.targetUserId) {
-    return db.user.findUnique({ where: { id: body.targetUserId } })
+/**
+ * Resolves the follow target from `targetUserId` or `username`.
+ *
+ * The username lookup goes through the `usernameLower` index. The old handler
+ * compared the raw `username` column, so asking for `alice` while the row said
+ * `Alice` answered 404 for a user that plainly exists.
+ */
+async function resolveTarget(input: FollowTarget): Promise<ProfileRow> {
+  const rawId = optString(input.targetUserId, 'targetUserId')
+  if (rawId !== undefined && rawId.trim() !== '') {
+    const byId = await findUserById(assertId(rawId, 'targetUserId'))
+    if (byId) return byId
+    throw notFoundError('Pengguna tidak ditemukan')
   }
-  if (body.username) {
-    return db.user.findFirst({ where: { username: body.username } })
+
+  const rawName = optString(input.username, 'username')
+  if (rawName !== undefined && rawName.trim() !== '') {
+    const byName = await findUserByUsername(rawName)
+    if (byName) return byName
+    throw notFoundError('Pengguna tidak ditemukan')
   }
-  return null
+
+  throw notFoundError('Pengguna tidak ditemukan')
 }
 
 // POST /api/follow — follow a user
-export const POST = withErrorHandler(async (req: NextRequest) => {
+//   → { isFollowing, followersCount }
+export const POST = withErrorHandler(async (req) => {
   const me = await requireUser()
-  const body = await parseJson<FollowBody>(req)
+  const body = await parseJson<FollowTarget>(req)
   const target = await resolveTarget(body)
-  if (!target) return notFound('Pengguna tidak ditemukan')
 
-  if (target.id === me.id) return badRequest('Tidak bisa follow diri sendiri')
+  if (target.id === me.id) throw badRequestError('Tidak bisa follow diri sendiri')
 
-  // Create follow (handle unique constraint — if exists, treat as already following)
-  try {
-    await db.follow.create({
-      data: { followerId: me.id, followingId: target.id },
-    })
-    // Create notification for the target user
-    await db.notification.create({
-      data: { userId: target.id, actorId: me.id, type: 'follow' },
-    })
-  } catch (err: any) {
-    if (err?.code === 'P2002') {
-      // unique constraint — already following, that's fine
-    } else {
-      throw err
+  // `INSERT OR IGNORE` against UNIQUE (followerId, followingId): following twice
+  // is a no-op instead of the old `catch (P2002)` dance, and `created` tells us
+  // whether a notification is warranted.
+  const { created } = await followUser(me.id, target.id)
+  if (created) {
+    try {
+      await createNotification({ userId: target.id, actorId: me.id, type: 'follow' })
+    } catch (err) {
+      // Best-effort: the follow edge is already stored and must not be undone.
+      console.error('[follow] gagal membuat notifikasi', err)
     }
   }
 
-  const followersCount = await db.follow.count({
-    where: { followingId: target.id },
-  })
-
-  return ok({ isFollowing: true, followersCount })
+  return ok({ isFollowing: true, followersCount: await followersCount(target.id) })
 })
 
 // DELETE /api/follow — unfollow a user
-export const DELETE = withErrorHandler(async (req: NextRequest) => {
+//   Target may arrive as a JSON body or as a query string.
+//   → { isFollowing, followersCount }
+export const DELETE = withErrorHandler(async (req) => {
   const me = await requireUser()
-  // body may be sent as JSON or as query string
-  let body: FollowBody = {}
-  const contentType = req.headers.get('content-type') || ''
-  if (contentType.includes('application/json')) {
-    body = await parseJson<FollowBody>(req)
-  }
-  // also accept query params as fallback
-  const url = new URL(req.url)
-  body.targetUserId = body.targetUserId ?? url.searchParams.get('targetUserId') ?? undefined
-  body.username = body.username ?? url.searchParams.get('username') ?? undefined
 
-  const target = await resolveTarget(body)
-  if (!target) return notFound('Pengguna tidak ditemukan')
+  const contentType = req.headers.get('content-type') ?? ''
+  const body: FollowTarget = contentType.includes('application/json')
+    ? await parseJson<FollowTarget>(req)
+    : {}
 
-  await db.follow.deleteMany({
-    where: { followerId: me.id, followingId: target.id },
+  const { searchParams } = new URL(req.url)
+  const target = await resolveTarget({
+    targetUserId: body.targetUserId ?? searchParams.get('targetUserId'),
+    username: body.username ?? searchParams.get('username'),
   })
 
-  const followersCount = await db.follow.count({
-    where: { followingId: target.id },
-  })
+  await unfollowUser(me.id, target.id)
 
-  return ok({ isFollowing: false, followersCount })
+  return ok({ isFollowing: false, followersCount: await followersCount(target.id) })
 })

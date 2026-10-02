@@ -38,6 +38,26 @@ export default function Page() {
     }
   }, [loading, user])
 
+  // ── Deep link: /?post=<id> ─────────────────────
+  // `PostCard`'s share button produces this URL. The SPA is the only reader of
+  // the router, so the param is consumed here — on mount and on popstate — and
+  // then stripped from the address bar.
+  useEffect(() => {
+    if (loading || !user) return
+
+    const openFromUrl = () => {
+      const id = new URLSearchParams(window.location.search).get('post')
+      if (!id) return
+      useViewStore.getState().navigate('post-detail', { postId: id })
+      const url = `${window.location.pathname}${window.location.hash}`
+      window.history.replaceState(null, '', url)
+    }
+
+    openFromUrl()
+    window.addEventListener('popstate', openFromUrl)
+    return () => window.removeEventListener('popstate', openFromUrl)
+  }, [loading, user])
+
   // ── Loading state ─────────────────────────────
   if (loading) {
     return (

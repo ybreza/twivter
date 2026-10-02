@@ -19,7 +19,9 @@ interface ExploreData {
 }
 
 export function TrendingSidebar() {
-  const { searchQuery, setSearchQuery, navigate } = useViewStore()
+  const searchQuery = useViewStore((s) => s.searchQuery)
+  const setSearchQuery = useViewStore((s) => s.setSearchQuery)
+  const navigate = useViewStore((s) => s.navigate)
 
   return (
     <div className="space-y-4">
@@ -43,7 +45,8 @@ export function TrendingSidebar() {
 }
 
 function TrendsCard() {
-  const { setSearchQuery, navigate } = useViewStore()
+  const setSearchQuery = useViewStore((s) => s.setSearchQuery)
+  const navigate = useViewStore((s) => s.navigate)
   const { data, loading } = useApi<ExploreData>('/api/explore', {})
 
   return (
@@ -98,7 +101,7 @@ function TrendsCard() {
 }
 
 function WhoToFollowCard() {
-  const { navigate } = useViewStore()
+  const navigate = useViewStore((s) => s.navigate)
   const { data, loading } = useApi<ExploreData>('/api/explore', {})
 
   return (

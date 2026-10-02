@@ -15,8 +15,8 @@ import { Label } from '@/components/ui/label'
 import { Loader2, Camera, Check, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/app-store'
-import { apiPatch, apiPost } from '@/lib/hooks'
-import { validateImageFile } from '@/lib/utils'
+import { apiPatch } from '@/lib/hooks'
+import { useImageUpload } from '@/hooks/use-image-upload'
 import type { ProfileDTO } from '@/lib/types'
 
 interface EditProfileDialogProps {
@@ -40,14 +40,48 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
   const [avatarUrl, setAvatarUrl] = useState(user?.avatarUrl ?? null)
   const [coverUrl, setCoverUrl] = useState(user?.coverUrl ?? null)
 
-  const [avatarUploading, setAvatarUploading] = useState(false)
-  const [coverUploading, setCoverUploading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [usernameStatus, setUsernameStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'invalid'>('idle')
 
   const avatarInputRef = useRef<HTMLInputElement>(null)
   const coverInputRef = useRef<HTMLInputElement>(null)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Mirrors the uploaded URLs so the change handlers can tell a successful
+  // upload from a rejected one after the hook resolves.
+  const avatarUrlRef = useRef<string | null>(null)
+  const coverUrlRef = useRef<string | null>(null)
+
+  // Uploads go through the shared hook: it converts to WebP in the browser (the
+  // `sharp` server step is gone) and reports progress. `replaceMedia` is
+  // referentially stable, so it is safe as an effect dependency.
+  const {
+    uploading: avatarUploading,
+    progress: avatarProgress,
+    handleFiles: handleAvatarFiles,
+    replaceMedia: replaceAvatarMedia,
+  } = useImageUpload({
+    bucket: BUCKET_AVATARS,
+    max: 1,
+    onChange: (media) => {
+      const url = media[0]?.url ?? null
+      avatarUrlRef.current = url
+      setAvatarUrl(url)
+    },
+  })
+  const {
+    uploading: coverUploading,
+    progress: coverProgress,
+    handleFiles: handleCoverFiles,
+    replaceMedia: replaceCoverMedia,
+  } = useImageUpload({
+    bucket: BUCKET_COVERS,
+    max: 1,
+    onChange: (media) => {
+      const url = media[0]?.url ?? null
+      coverUrlRef.current = url
+      setCoverUrl(url)
+    },
+  })
 
   // Reset form when dialog opens
   useEffect(() => {
@@ -59,9 +93,13 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
       setLocation(user.location ?? '')
       setAvatarUrl(user.avatarUrl ?? null)
       setCoverUrl(user.coverUrl ?? null)
+      avatarUrlRef.current = user.avatarUrl ?? null
+      coverUrlRef.current = user.coverUrl ?? null
+      replaceAvatarMedia(user.avatarUrl ? [{ url: user.avatarUrl, type: 'image' }] : [])
+      replaceCoverMedia(user.coverUrl ? [{ url: user.coverUrl, type: 'image' }] : [])
       setUsernameStatus('idle')
     }
-  }, [open, user])
+  }, [open, user, replaceAvatarMedia, replaceCoverMedia])
 
   // Live username availability check (excluding self)
   useEffect(() => {
@@ -96,49 +134,34 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
     }
   }, [username, open, user])
 
-  const uploadFile = async (file: File, bucket: typeof BUCKET_AVATARS | typeof BUCKET_COVERS) => {
-    const maxSize = bucket === BUCKET_AVATARS ? 5 : 10
-    const err = validateImageFile(file, maxSize)
-    if (err) {
-      toast.error(err)
-      return null
-    }
-    const fd = new FormData()
-    fd.append('file', file)
-    fd.append('bucket', bucket)
-    try {
-      const data = await apiPost<{ url: string }>(`/api/upload`, fd)
-      return data.url
-    } catch (e: any) {
-      toast.error(e.message || 'Gagal upload gambar')
-      return null
-    }
-  }
-
   const onAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setAvatarUploading(true)
-    const url = await uploadFile(file, BUCKET_AVATARS)
-    if (url) {
-      setAvatarUrl(url)
-      toast.success('Foto profil diperbarui')
-    }
-    setAvatarUploading(false)
+    const files = Array.from(e.target.files ?? [])
+    if (files.length === 0) return
     if (avatarInputRef.current) avatarInputRef.current.value = ''
+    const before = avatarUrlRef.current
+    // Single slot: free it first, otherwise the hook reports the slot as full.
+    replaceAvatarMedia([])
+    await handleAvatarFiles(files)
+    if (avatarUrlRef.current) {
+      toast.success('Foto profil diperbarui')
+    } else if (before) {
+      // Upload rejected — put the previous preview back.
+      replaceAvatarMedia([{ url: before, type: 'image' }])
+    }
   }
 
   const onCoverChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setCoverUploading(true)
-    const url = await uploadFile(file, BUCKET_COVERS)
-    if (url) {
-      setCoverUrl(url)
-      toast.success('Sampul diperbarui')
-    }
-    setCoverUploading(false)
+    const files = Array.from(e.target.files ?? [])
+    if (files.length === 0) return
     if (coverInputRef.current) coverInputRef.current.value = ''
+    const before = coverUrlRef.current
+    replaceCoverMedia([])
+    await handleCoverFiles(files)
+    if (coverUrlRef.current) {
+      toast.success('Sampul diperbarui')
+    } else if (before) {
+      replaceCoverMedia([{ url: before, type: 'image' }])
+    }
   }
 
   const canSave = () => {
@@ -243,6 +266,14 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
                   </span>
                 )}
               </div>
+              {coverUploading && (
+                <div className="absolute bottom-0 left-0 h-1 w-full bg-black/40">
+                  <div
+                    className="h-full bg-primary transition-all"
+                    style={{ width: `${coverProgress}%` }}
+                  />
+                </div>
+              )}
             </button>
             <input
               ref={coverInputRef}
@@ -269,6 +300,14 @@ export function EditProfileDialog({ open, onOpenChange, onSaved }: EditProfileDi
                 <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
                   {avatarUploading ? <Loader2 className="h-5 w-5 animate-spin" /> : <Camera className="h-5 w-5" />}
                 </div>
+                {avatarUploading && (
+                  <div className="absolute bottom-0 left-0 h-1 w-full bg-black/40">
+                    <div
+                      className="h-full bg-primary transition-all"
+                      style={{ width: `${avatarProgress}%` }}
+                    />
+                  </div>
+                )}
               </button>
               <input
                 ref={avatarInputRef}

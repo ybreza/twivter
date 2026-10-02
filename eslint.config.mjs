@@ -44,7 +44,21 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "no-useless-escape": "off",
   },
 }, {
-  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills"]
+  // `scripts/**` holds Node utilities and, in `seed.mjs`, a pure SQL file that
+  // is executed by `wrangler d1 execute --file` — none of it is application code.
+  ignores: [
+    "node_modules/**",
+    ".next/**",
+    ".open-next/**",
+    ".wrangler/**",
+    "out/**",
+    "build/**",
+    "next-env.d.ts",
+    "cloudflare-env.d.ts",
+    "examples/**",
+    "skills/**",
+    "scripts/**",
+  ],
 }];
 
 export default eslintConfig;

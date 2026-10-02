@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { toast } from 'sonner'
 import {
   Shield,
@@ -73,13 +73,17 @@ interface AdminReport {
 
 interface AdminVerification {
   id: string
-  user: ProfileDTO
+  /** The route returns `ProfileDTO | null` — the requesting user row can be gone. */
+  user: ProfileDTO | null
   reason: string
   status: string
   createdAt: string
 }
 
 type AdminTab = 'reports' | 'verifications' | 'users'
+
+/** A verification request whose user row actually exists. */
+type PendingVerification = Omit<AdminVerification, 'user'> & { user: ProfileDTO }
 
 const STATUS_COLORS: Record<string, string> = {
   pending: 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30',
@@ -176,14 +180,14 @@ export function AdminView() {
               label="Total pengguna"
               value={stats.users}
               color="from-sky-500/15 to-sky-500/5 text-sky-600 dark:text-sky-400"
-              trend={`${stats.growth.reduce((a, b) => a + b.users, 0)} baru 7 hari`}
+              trend={`${(stats.growth ?? []).reduce((a, b) => a + b.users, 0)} baru 7 hari`}
             />
             <StatCard
               icon={FileText}
               label="Total post"
               value={stats.posts}
               color="from-violet-500/15 to-violet-500/5 text-violet-600 dark:text-violet-400"
-              trend={`${stats.growth.reduce((a, b) => a + b.posts, 0)} baru 7 hari`}
+              trend={`${(stats.growth ?? []).reduce((a, b) => a + b.posts, 0)} baru 7 hari`}
             />
             <button
               onClick={() => setTab('reports')}
@@ -228,7 +232,7 @@ export function AdminView() {
             <div className="h-56 w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
-                  data={stats.growth}
+                  data={stats.growth ?? []}
                   margin={{ top: 5, right: 12, bottom: 0, left: -16 }}
                 >
                   <defs>
@@ -414,7 +418,15 @@ function ReportsTab({ onResolveChange }: { onResolveChange: () => void }) {
     try {
       await apiPatch(`/api/admin/reports/${id}`, { status })
       toast.success(`Laporan ${STATUS_LABEL[status].toLowerCase()}`)
-      setReports((prev) => prev.filter((r) => r.id !== id))
+      // `reviewed` is not terminal: with the "Semua status" filter the row must
+      // stay visible (with its new status), otherwise it silently disappeared.
+      if (status === 'resolved' || status === 'dismissed') {
+        setReports((prev) => prev.filter((r) => r.id !== id))
+      } else {
+        setReports((prev) =>
+          prev.map((r) => (r.id === id ? { ...r, status } : r))
+        )
+      }
       onResolveChange()
     } catch (e: any) {
       toast.error(e.message || 'Gagal memperbarui laporan')
@@ -568,7 +580,7 @@ function AuthorChip({ author }: { author: AuthorDTO }) {
 
 // ─── Verifications tab ────────────────────────────
 function VerificationsTab({ onVerdictChange }: { onVerdictChange: () => void }) {
-  const [requests, setRequests] = useState<AdminVerification[]>([])
+  const [requests, setRequests] = useState<PendingVerification[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState<Set<string>>(new Set())
@@ -577,13 +589,22 @@ function VerificationsTab({ onVerdictChange }: { onVerdictChange: () => void }) 
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('/api/admin/verifications', { cache: 'no-store' })
+      // Only pending: without the filter the route returns every status, so
+      // already-approved/rejected requests could be decided again.
+      const res = await fetch('/api/admin/verifications?status=pending', {
+        cache: 'no-store',
+      })
       if (!res.ok) {
         const e = await res.json().catch(() => ({}))
         throw new Error((e as any).error || `HTTP ${res.status}`)
       }
       const json = await res.json()
-      setRequests(json.requests ?? [])
+      // `user` is nullable — a request whose user row is gone must not crash
+      // the list.
+      const list: PendingVerification[] = (json.requests ?? []).filter(
+        (r: AdminVerification) => !!r.user
+      )
+      setRequests(list)
     } catch (e: any) {
       setError(e.message || 'Gagal memuat permintaan verifikasi')
     } finally {
@@ -642,29 +663,31 @@ function VerificationsTab({ onVerdictChange }: { onVerdictChange: () => void }) 
               className="rounded-lg border border-border p-3 md:p-4 space-y-3"
             >
               <div className="flex items-start gap-3">
+                {/* `user` is nullable: the account can be deleted while the
+                    request row survives. Guarded rather than dereferenced. */}
                 <UserAvatar
-                  username={v.user.username}
-                  displayName={v.user.displayName}
-                  avatarUrl={v.user.avatarUrl}
-                  verified={v.user.verified}
+                  username={v.user?.username ?? '?'}
+                  displayName={v.user?.displayName ?? 'Akun dihapus'}
+                  avatarUrl={v.user?.avatarUrl ?? null}
+                  verified={v.user?.verified ?? false}
                   size="md"
                 />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-semibold truncate">
-                      {v.user.displayName}
+                      {v.user?.displayName ?? 'Akun dihapus'}
                     </span>
-                    {v.user.verified && (
+                    {v.user?.verified && (
                       <BadgeCheck className="h-4 w-4 text-primary" />
                     )}
                   </div>
                   <p className="text-xs text-muted-foreground truncate">
-                    @{v.user.username}
+                    {v.user ? `@${v.user.username}` : '—'}
                   </p>
                   <p className="text-xs text-muted-foreground mt-1">
-                    {v.user.followersCount.toLocaleString('id-ID')} pengikut ·{' '}
-                    {v.user.postsCount.toLocaleString('id-ID')} post ·{' '}
-                    {timeAgo(v.user.createdAt)} bergabung
+                    {(v.user?.followersCount ?? 0).toLocaleString('id-ID')} pengikut ·{' '}
+                    {(v.user?.postsCount ?? 0).toLocaleString('id-ID')} post
+                    {v.user ? ` · ${timeAgo(v.user.createdAt)} bergabung` : ''}
                   </p>
                 </div>
                 <span className="text-xs text-muted-foreground shrink-0">
@@ -717,6 +740,10 @@ function UsersTab() {
   const [pending, setPending] = useState<Set<string>>(new Set())
   const currentUser = useAuthStore((s) => s.user)
 
+  // Set by the debounce cleanup so a slow response for an earlier query can
+  // never overwrite the results for the current one.
+  const ignoreRef = useRef(false)
+
   const fetchUsers = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -731,20 +758,28 @@ function UsersTab() {
         throw new Error((e as any).error || `HTTP ${res.status}`)
       }
       const json = await res.json()
+      if (ignoreRef.current) return
       setUsers(json.users ?? [])
     } catch (e: any) {
+      if (ignoreRef.current) return
       setError(e.message || 'Gagal memuat pengguna')
     } finally {
-      setLoading(false)
+      if (!ignoreRef.current) setLoading(false)
     }
   }, [q, roleFilter])
 
   // Debounced fetch: also runs on mount (initial load)
   useEffect(() => {
+    ignoreRef.current = false
     const t = setTimeout(() => {
-      fetchUsers()
+      fetchUsers().catch(() => {
+        /* handled inside fetchUsers */
+      })
     }, 300)
-    return () => clearTimeout(t)
+    return () => {
+      clearTimeout(t)
+      ignoreRef.current = true
+    }
   }, [fetchUsers])
 
   const updateUserField = async (

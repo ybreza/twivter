@@ -1,94 +1,41 @@
-import { db } from '@/lib/db'
 import {
+  createSession,
   hashPassword,
-  createSessionToken,
   setSessionCookie,
-  getCurrentUser,
-  validateUsername,
   validateEmail,
   validatePassword,
+  validateUsername,
 } from '@/lib/auth'
-import {
-  created,
-  badRequest,
-  conflict,
-  serverError,
-  withErrorHandler,
-  parseJson,
-} from '@/lib/api'
+import { badRequestError, created, parseJson, withErrorHandler } from '@/lib/api'
+import { createUser } from '@/lib/data/users'
+import { loadCurrentUser } from '@/lib/auth'
+import { reqString } from '@/lib/validate'
 
-export const POST = withErrorHandler(async (req: Request) => {
-  const body = await parseJson<{
-    email?: string
-    password?: string
-    username?: string
-    displayName?: string
-  }>(req)
+export const POST = withErrorHandler(async (req) => {
+  const body = await parseJson(req)
+  const email = reqString(body.email, 'email').trim().toLowerCase()
+  const password = reqString(body.password, 'password')
+  const username = reqString(body.username, 'username').trim()
+  const displayName = (typeof body.displayName === 'string' && body.displayName.trim()) || username
 
-  const email = (body.email ?? '').trim().toLowerCase()
-  const password = body.password ?? ''
-  const username = (body.username ?? '').trim()
-  const displayName = (body.displayName ?? '').trim()
+  const emailError = validateEmail(email)
+  if (emailError) throw badRequestError(emailError)
+  const usernameError = validateUsername(username)
+  if (usernameError) throw badRequestError(usernameError)
+  const passwordError = validatePassword(password)
+  if (passwordError) throw badRequestError(passwordError)
+  if (displayName.length > 50) throw badRequestError('Nama tampilan maksimal 50 karakter')
 
-  // Validate inputs
-  const emailErr = validateEmail(email)
-  if (emailErr) return badRequest(emailErr)
+  const passwordHash = await hashPassword(password)
+  // Throws 409 when the email or username is already taken.
+  const userId = await createUser({ email, passwordHash, username, displayName })
 
-  const passwordErr = validatePassword(password)
-  if (passwordErr) return badRequest(passwordErr)
+  const token = await createSession(userId)
+  await setSessionCookie(token)
 
-  const usernameErr = validateUsername(username)
-  if (usernameErr) return badRequest(usernameErr)
-
-  if (!displayName || displayName.length < 1) {
-    return badRequest('Nama tampilan wajib diisi')
-  }
-  if (displayName.length > 50) {
-    return badRequest('Nama tampilan maksimal 50 karakter')
-  }
-
-  // Case-insensitive username check (SQLite: use raw SQL with LOWER())
-  const conflicts = await db.$queryRaw<{ id: string; email: string }[]>`
-    SELECT id, email FROM User
-    WHERE LOWER(email) = LOWER(${email})
-       OR LOWER(username) = LOWER(${username})
-    LIMIT 1
-  `
-  const existing = conflicts[0]
-
-  if (existing) {
-    if (existing.email.toLowerCase() === email) {
-      return conflict('Email sudah digunakan')
-    }
-    return conflict('Username sudah digunakan')
-  }
-
-  try {
-    const passwordHash = await hashPassword(password)
-    const user = await db.user.create({
-      data: {
-        email,
-        passwordHash,
-        username,
-        displayName,
-        role: 'user',
-        onboarded: false,
-      },
-    })
-
-    const token = await createSessionToken({
-      userId: user.id,
-      email: user.email,
-      username: user.username,
-    })
-    await setSessionCookie(token)
-
-    const currentUser = await getCurrentUser()
-    return created({ user: currentUser })
-  } catch (err: any) {
-    if (err?.code === 'P2002') {
-      return conflict('Email atau username sudah digunakan')
-    }
-    return serverError('Gagal membuat akun', err?.message)
-  }
+  // Build the payload from the row we just created. The old code called
+  // `getCurrentUser()` immediately after setting the cookie, which can return
+  // null because the cookie is only written to the outgoing response.
+  const user = await loadCurrentUser(userId)
+  return created({ user })
 })

@@ -1,141 +1,121 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
-import { getCurrentUser } from '@/lib/auth'
 import { ok, withErrorHandler } from '@/lib/api'
-import { serializePost, serializeProfile, POST_INCLUDE } from '@/lib/serialize'
+import { getCurrentUser } from '@/lib/auth'
+import { all } from '@/lib/db'
+import { fetchPostsByIds } from '@/lib/data/posts'
+import { suggestUsers } from '@/lib/data/users'
+import type { PostDTO } from '@/lib/types'
 
-// GET /api/explore — returns trending tags + suggested users + trending posts
-export const GET = withErrorHandler(async (req: NextRequest) => {
-  const user = await getCurrentUser()
+// ── Bounds ────────────────────────────────────────────────────────────────────
+// The old handler scanned 1000 rows for hashtags, materialised every `Like` row
+// for the 200 newest posts, and then aggregated 1000 follows — all unbounded
+// from the outside and none of them cached.
+const TAG_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+const TAG_SCAN_LIMIT = 300
+const TAG_LIMIT = 10
+const TAG_CACHE_TTL_MS = 60_000
 
-  // ── Trending hashtags ──────────────────────
-  // Scan last 1000 posts for #hashtags, count occurrences, return top 10.
-  const recentPosts = await db.post.findMany({
-    where: { createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } },
-    select: { content: true },
-    take: 1000,
-    orderBy: { createdAt: 'desc' },
-  })
+const POST_WINDOW_MS = 24 * 60 * 60 * 1000
+const TRENDING_POST_LIMIT = 5
+const SUGGESTED_USER_LIMIT = 5
 
-  const tagCounts = new Map<string, number>()
-  const hashtagRegex = /#([\p{L}\p{N}_]+)/gu
-  for (const p of recentPosts) {
-    const matches = p.content.matchAll(hashtagRegex)
-    for (const m of matches) {
-      const tag = m[1].toLowerCase()
-      tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1)
+export interface TrendingTag {
+  tag: string
+  postsCount: number
+}
+
+const FALLBACK_TRENDS: TrendingTag[] = [
+  { tag: 'twivter', postsCount: 128 },
+  { tag: 'teknologi', postsCount: 86 },
+  { tag: 'startup', postsCount: 54 },
+  { tag: 'ai', postsCount: 42 },
+  { tag: 'programming', postsCount: 31 },
+  { tag: 'olahraga', postsCount: 24 },
+  { tag: 'kuliner', postsCount: 19 },
+]
+
+// Hashtags change slowly and cost a table scan, so the result is memoised for a
+// minute per isolate instead of being recomputed on every request.
+let tagCache: { value: TrendingTag[]; expiresAt: number } | null = null
+
+async function trendingTags(): Promise<TrendingTag[]> {
+  if (tagCache && tagCache.expiresAt > Date.now()) return tagCache.value
+
+  const since = new Date(Date.now() - TAG_WINDOW_MS).toISOString()
+  // `LIKE '%#%'` lets SQLite skip posts that cannot contain a tag at all.
+  const rows = await all<{ content: string }>(
+    `SELECT content
+       FROM Post
+      WHERE createdAt >= ? AND content LIKE '%#%'
+      ORDER BY id DESC
+      LIMIT ?`,
+    [since, TAG_SCAN_LIMIT],
+  )
+
+  const counts = new Map<string, number>()
+  const hashtag = /#([\p{L}\p{N}_]+)/gu
+  for (const row of rows) {
+    for (const match of row.content.matchAll(hashtag)) {
+      const tag = match[1].toLowerCase()
+      counts.set(tag, (counts.get(tag) ?? 0) + 1)
     }
   }
 
-  let trending = [...tagCounts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
+  const tags = [...counts.entries()]
+    // Explicit tie-break so the list is stable across requests.
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, TAG_LIMIT)
     .map(([tag, postsCount]) => ({ tag, postsCount }))
 
-  // Synthesize fallback trends if none found
-  if (trending.length === 0) {
-    trending = [
-      { tag: 'twivter', postsCount: 128 },
-      { tag: 'teknologi', postsCount: 86 },
-      { tag: 'startup', postsCount: 54 },
-      { tag: 'ai', postsCount: 42 },
-      { tag: 'programming', postsCount: 31 },
-      { tag: 'olahraga', postsCount: 24 },
-      { tag: 'kuliner', postsCount: 19 },
-    ]
+  const value = tags.length > 0 ? tags : FALLBACK_TRENDS
+  tagCache = { value, expiresAt: Date.now() + TAG_CACHE_TTL_MS }
+  return value
+}
+
+async function trendingPosts(currentUserId: string | null): Promise<PostDTO[]> {
+  const since = new Date(Date.now() - POST_WINDOW_MS).toISOString()
+
+  // Counts come from a single JOIN aggregate over the window instead of loading
+  // one row per `Like` into memory and counting in JS.
+  const top = await all<{ id: string }>(
+    `SELECT p.id
+       FROM Post p
+       JOIN Like l ON l.postId = p.id
+      WHERE p.replyToId IS NULL AND p.createdAt >= ?
+      GROUP BY p.id
+      ORDER BY COUNT(l.id) DESC, p.id DESC
+      LIMIT ?`,
+    [since, TRENDING_POST_LIMIT],
+  )
+
+  let ids = top.map((row) => row.id)
+  if (ids.length === 0) {
+    // Fallback: the newest root posts.
+    const latest = await all<{ id: string }>(
+      `SELECT id FROM Post WHERE replyToId IS NULL ORDER BY id DESC LIMIT ?`,
+      [TRENDING_POST_LIMIT],
+    )
+    ids = latest.map((row) => row.id)
   }
+  if (ids.length === 0) return []
 
-  // ── Trending posts (top 5 by like count in last 24h) ───
-  // NOTE: Prisma's `groupBy({ orderBy: { _count: { _all: 'desc' } } })` is not
-  // supported on SQLite. We instead fetch recent posts + their likes and sort
-  // in JS — fine for the demo dataset.
-  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
-  const recentTopLevelPosts = await db.post.findMany({
-    where: { createdAt: { gte: dayAgo }, replyToId: null },
-    select: { id: true },
-    take: 200,
-    orderBy: { createdAt: 'desc' },
-  })
+  const map = await fetchPostsByIds(ids, currentUserId)
+  // Preserve the ranking produced above.
+  return ids
+    .map((id) => map.get(id))
+    .filter((post): post is PostDTO => Boolean(post))
+}
 
-  let trendingPosts: Awaited<ReturnType<typeof serializePost>>[] = []
-  if (recentTopLevelPosts.length > 0) {
-    const postIds = recentTopLevelPosts.map((p) => p.id)
-    const likes = await db.like.findMany({
-      where: { postId: { in: postIds } },
-      select: { postId: true },
-    })
-    const counts = new Map<string, number>()
-    for (const l of likes) {
-      counts.set(l.postId, (counts.get(l.postId) ?? 0) + 1)
-    }
-    const topIds = [...counts.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([id]) => id)
+// GET /api/explore — trending tags + suggested users + trending posts
+//   → { trending: { tag, postsCount }[], suggestedUsers: ProfileDTO[], trendingPosts: PostDTO[] }
+export const GET = withErrorHandler(async () => {
+  const user = await getCurrentUser()
+  const currentUserId = user?.id ?? null
 
-    if (topIds.length > 0) {
-      const posts = await db.post.findMany({
-        where: { id: { in: topIds } },
-        include: POST_INCLUDE,
-      })
-      const order = new Map(topIds.map((id, i) => [id, i]))
-      posts.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
-      trendingPosts = await Promise.all(posts.map((p) => serializePost(p, user?.id)))
-    }
-  }
+  const [trending, posts, suggestedUsers] = await Promise.all([
+    trendingTags(),
+    trendingPosts(currentUserId),
+    suggestUsers(currentUserId, SUGGESTED_USER_LIMIT),
+  ])
 
-  // Fallback: latest 5 posts if no trending posts found
-  if (trendingPosts.length === 0) {
-    const fallback = await db.post.findMany({
-      where: { replyToId: null },
-      include: POST_INCLUDE,
-      orderBy: { createdAt: 'desc' },
-      take: 5,
-    })
-    trendingPosts = await Promise.all(fallback.map((p) => serializePost(p, user?.id)))
-  }
-
-  // ── Suggested users (top 5 by follower count, exclude current user) ───
-  // Again, `groupBy` with `_count._all` orderBy is unsupported on SQLite —
-  // fetch follows for non-me/non-followed users and aggregate in JS.
-  const followingIds = user
-    ? (await db.follow.findMany({ where: { followerId: user.id }, select: { followingId: true } })).map(
-        (f) => f.followingId
-      )
-    : []
-  const excludeIds = [...followingIds, ...(user ? [user.id] : [])]
-
-  const follows = await db.follow.findMany({
-    where: { followingId: { notIn: excludeIds.length > 0 ? excludeIds : undefined } },
-    select: { followingId: true },
-    take: 1000,
-  })
-  const userFollowerCounts = new Map<string, number>()
-  for (const f of follows) {
-    userFollowerCounts.set(f.followingId, (userFollowerCounts.get(f.followingId) ?? 0) + 1)
-  }
-  const topUserIds = [...userFollowerCounts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([id]) => id)
-
-  let suggestedUsers: Awaited<ReturnType<typeof serializeProfile>>[] = []
-  if (topUserIds.length > 0) {
-    const users = await db.user.findMany({
-      where: { id: { in: topUserIds } },
-    })
-    const order = new Map(topUserIds.map((id, i) => [id, i]))
-    users.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
-    suggestedUsers = await Promise.all(users.map((u) => serializeProfile(u, user?.id)))
-  } else {
-    // fallback: any 5 users not me
-    const fallback = await db.user.findMany({
-      where: user ? { id: { not: user.id } } : {},
-      take: 5,
-      orderBy: { createdAt: 'asc' },
-    })
-    suggestedUsers = await Promise.all(fallback.map((u) => serializeProfile(u, user?.id)))
-  }
-
-  return ok({ trending, suggestedUsers, trendingPosts })
+  return ok({ trending, suggestedUsers, trendingPosts: posts })
 })

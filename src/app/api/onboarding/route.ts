@@ -1,149 +1,125 @@
-import { db } from '@/lib/db'
-import {
-  getCurrentUser,
-  validateUsername,
-} from '@/lib/auth'
-import {
-  ok,
-  badRequest,
-  unauthorized,
-  conflict,
-  serverError,
-  withErrorHandler,
-  parseJson,
-} from '@/lib/api'
+import { badRequestError, conflictError, isUniqueViolation, ok, parseJson, withErrorHandler } from '@/lib/api'
+import { loadCurrentUser, requireUser, validateUsername } from '@/lib/auth'
+import { all, execute, type BindValue } from '@/lib/db'
+import { assertUsernameAvailable, followUser } from '@/lib/data/users'
+import { createNotification } from '@/lib/data/notifications'
+import { inCondition } from '@/lib/sql'
+import { optIdArray, optNullableText, optSafeUrl, optStringArray, optTrimmed } from '@/lib/validate'
+import { INTEREST_OPTIONS } from '@/lib/types'
 
-export const POST = withErrorHandler(async (req: Request) => {
-  const currentUser = await getCurrentUser()
-  if (!currentUser) return unauthorized()
+const HTTP_URL = /^https?:\/\/[^\s]+$/i
+const MAX_INTERESTS = 10
+const MAX_RAW_INTERESTS = 50
+// The wizard offers at most a handful of accounts to pick from; the old handler
+// accepted an unbounded array and turned it into one giant `IN (...)`.
+const MAX_FOLLOWS = 30
 
-  const body = await parseJson<{
-    username?: string
-    displayName?: string
-    bio?: string
-    website?: string
-    location?: string
-    avatarUrl?: string
-    interests?: string[]
-    followUserIds?: string[]
-  }>(req)
+// POST /api/onboarding — one-shot profile setup
+//   → { user: CurrentUser }
+//
+// Onboarding is a wizard that must run exactly once. The old handler never
+// checked `onboarded`, so a completed user could re-POST at any time and
+// overwrite their username, display name, bio and interests (and re-run the
+// follow inserts).
+export const POST = withErrorHandler(async (req) => {
+  const me = await requireUser()
+  if (me.onboarded) throw conflictError('Onboarding sudah diselesaikan')
 
-  const username = (body.username ?? '').trim()
-  const displayName = (body.displayName ?? '').trim()
-  const bio = (body.bio ?? '').trim()
-  const website = (body.website ?? '').trim()
-  const location = (body.location ?? '').trim()
-  const avatarUrl = body.avatarUrl ?? null
-  const interests = Array.isArray(body.interests) ? body.interests : []
-  const followUserIds = Array.isArray(body.followUserIds) ? body.followUserIds : []
+  const body = await parseJson<Record<string, unknown>>(req)
 
-  // Validate
-  const usernameErr = validateUsername(username)
-  if (usernameErr) return badRequest(usernameErr)
+  const username = optTrimmed(body.username, 'username') ?? ''
+  const usernameError = validateUsername(username)
+  if (usernameError) throw badRequestError(usernameError)
 
-  if (!displayName) {
-    return badRequest('Nama tampilan wajib diisi')
-  }
-  if (displayName.length > 50) {
-    return badRequest('Nama tampilan maksimal 50 karakter')
+  const displayName = optTrimmed(body.displayName, 'displayName')
+  if (!displayName) throw badRequestError('Nama tampilan wajib diisi')
+  if (displayName.length > 50) throw badRequestError('Nama tampilan maksimal 50 karakter')
+
+  const bio = optNullableText(body.bio, 'bio') ?? null
+  if (bio !== null && bio.length > 160) throw badRequestError('Bio maksimal 160 karakter')
+
+  const website = optNullableText(body.website, 'website') ?? null
+  if (website !== null) {
+    if (website.length > 200) throw badRequestError('Website URL terlalu panjang')
+    if (!HTTP_URL.test(website)) {
+      throw badRequestError('Website harus diawali http:// atau https://')
+    }
   }
 
-  if (bio && bio.length > 160) {
-    return badRequest('Bio maksimal 160 karakter')
-  }
+  const location = optNullableText(body.location, 'location') ?? null
+  if (location !== null && location.length > 100) throw badRequestError('Lokasi maksimal 100 karakter')
 
-  if (website && website.length > 200) {
-    return badRequest('Website URL terlalu panjang')
-  }
+  // Rendered into `<img src>`; `javascript:` and `data:` are rejected.
+  // `undefined` (field omitted) leaves an existing avatar untouched.
+  const avatarUrl = optSafeUrl(body.avatarUrl, 'avatarUrl')
 
-  if (location && location.length > 100) {
-    return badRequest('Lokasi maksimal 100 karakter')
-  }
+  // Whitelist against INTEREST_OPTIONS, exactly like /api/profiles/me/interests.
+  // The old handler stored the raw array, so the same wizard could persist
+  // values the settings screen refuses to show.
+  const allowedInterests = new Set<string>(INTEREST_OPTIONS)
+  const rawInterests = optStringArray(body.interests, 'interests', MAX_RAW_INTERESTS) ?? []
+  const interests = [...new Set(rawInterests.filter((interest) => allowedInterests.has(interest)))]
+  if (interests.length > MAX_INTERESTS) throw badRequestError('Maksimal 10 minat')
 
-  if (interests.length > 10) {
-    return badRequest('Maksimal 10 minat')
-  }
-
-  // Validate followUserIds — must exist, not be self
-  const sanitizedFollowIds = Array.from(new Set(followUserIds)).filter(
-    (id) => id && id !== currentUser.id
+  const requestedFollowIds = (optIdArray(body.followUserIds, 'followUserIds', MAX_FOLLOWS) ?? []).filter(
+    (id) => id !== me.id,
   )
-  if (sanitizedFollowIds.length > 0) {
-    const validUsers = await db.user.findMany({
-      where: { id: { in: sanitizedFollowIds } },
-      select: { id: true },
-    })
-    const validIds = new Set(validUsers.map((u) => u.id))
-    sanitizedFollowIds.length = 0
-    sanitizedFollowIds.push(...Array.from(validIds))
+
+  // Checked before any write, comparing `usernameLower` so `Alice` can never be
+  // claimed while `alice` exists.
+  await assertUsernameAvailable(username, me.id)
+
+  // Keep only ids that resolve to a real account.
+  let followIds: string[] = []
+  const requested = inCondition('id', requestedFollowIds)
+  if (requested) {
+    const rows = await all<{ id: string }>(
+      `SELECT id FROM User WHERE ${requested.sql}`,
+      requested.params,
+    )
+    followIds = rows.map((row) => row.id)
   }
 
-  // Check username uniqueness (exclude self, case-insensitive via raw SQL — SQLite)
-  const conflicts = await db.$queryRaw<{ id: string }[]>`
-    SELECT id FROM User
-    WHERE LOWER(username) = LOWER(${username})
-      AND id != ${currentUser.id}
-    LIMIT 1
-  `
-  if (conflicts.length > 0) {
-    return conflict('Username sudah digunakan')
+  const columns: string[] = []
+  const params: BindValue[] = []
+  const set = (column: string, value: BindValue) => {
+    columns.push(`${column} = ?`)
+    params.push(value)
   }
+
+  set('username', username)
+  set('usernameLower', username.toLowerCase())
+  set('displayName', displayName)
+  set('bio', bio)
+  set('website', website)
+  set('location', location)
+  if (avatarUrl !== undefined) set('avatarUrl', avatarUrl)
+  set('interests', JSON.stringify(interests))
+  set('onboarded', 1)
+  set('updatedAt', new Date().toISOString())
 
   try {
-    const updated = await db.user.update({
-      where: { id: currentUser.id },
-      data: {
-        username,
-        displayName,
-        bio: bio || null,
-        website: website || null,
-        location: location || null,
-        avatarUrl: avatarUrl ?? undefined,
-        interests: JSON.stringify(interests),
-        onboarded: true,
-      },
-    })
-
-    // Create follow relationships (skip duplicates silently)
-    if (sanitizedFollowIds.length > 0) {
-      const existing = await db.follow.findMany({
-        where: {
-          followerId: currentUser.id,
-          followingId: { in: sanitizedFollowIds },
-        },
-        select: { followingId: true },
-      })
-      const existingSet = new Set(existing.map((f) => f.followingId))
-      const toCreate = sanitizedFollowIds
-        .filter((id) => !existingSet.has(id))
-        .map((followingId) => ({
-          followerId: currentUser.id,
-          followingId,
-        }))
-
-      if (toCreate.length > 0) {
-        // SQLite doesn't support `skipDuplicates` on createMany,
-        // but we've already filtered existing follows above.
-        await db.follow.createMany({ data: toCreate })
-
-        // Create follow notifications for each new follow
-        await db.notification.createMany({
-          data: toCreate.map((f) => ({
-            userId: f.followingId,
-            actorId: currentUser.id,
-            type: 'follow',
-          })),
-        })
-      }
-    }
-
-    // Re-fetch full CurrentUser shape (consistent with /api/auth/me)
-    const fresh = await getCurrentUser()
-    return ok({ user: fresh })
-  } catch (err: any) {
-    if (err?.code === 'P2002') {
-      return conflict('Username sudah digunakan')
-    }
-    return serverError('Gagal menyimpan onboarding', err?.message)
+    await execute(`UPDATE User SET ${columns.join(', ')} WHERE id = ?`, [...params, me.id])
+  } catch (err) {
+    // The only unique index on these columns is `usernameLower`, so a violation
+    // here really is the username — the follow inserts below no longer share
+    // this handler's error path at all.
+    if (isUniqueViolation(err)) throw conflictError('Username sudah digunakan')
+    throw err
   }
+
+  // Follows are idempotent (`INSERT OR IGNORE`): only newly created edges
+  // produce a notification, so a retried request cannot spam anyone.
+  for (const followingId of followIds) {
+    const { created } = await followUser(me.id, followingId)
+    if (!created) continue
+    try {
+      await createNotification({ userId: followingId, actorId: me.id, type: 'follow' })
+    } catch (err) {
+      // Best-effort: the profile write has already succeeded.
+      console.error('[onboarding] gagal membuat notifikasi follow', err)
+    }
+  }
+
+  return ok({ user: await loadCurrentUser(me.id) })
 })

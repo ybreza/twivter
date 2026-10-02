@@ -1,143 +1,146 @@
-// Shared serialization helpers — convert Prisma rows to DTOs the frontend expects.
-// All subagents MUST use these to keep API responses consistent.
-import { db } from './db'
+/**
+ * Pure DTO builders.
+ *
+ * The previous `serializePost`/`serializeProfile` ran 7 database queries *per
+ * object*, so a 20-post feed cost ~140 round-trips — and `/api/explore` and
+ * `/api/search` amplified that further. These functions are now pure: the
+ * repository layer in `src/lib/data/*` loads rows and aggregates in bulk, then
+ * hands the plain data to the builders below.
+ */
 import type {
-  PostDTO,
-  ProfileDTO,
   AuthorDTO,
+  PostDTO,
+  PostMediaDTO,
+  ProfileDTO,
   NotificationDTO,
   ConversationDTO,
   MessageDTO,
   CommunityDTO,
 } from './types'
 
-// ── Author ────────────────────────────────────
-export function toAuthor(user: {
+// ── Author ───────────────────────────────────────────────────────────────────
+
+export interface AuthorRow {
   id: string
   username: string
   displayName: string
   avatarUrl: string | null
-  verified: boolean
-}): AuthorDTO {
+  verified: number | boolean
+}
+
+export function toAuthor(user: AuthorRow): AuthorDTO {
   return {
     id: user.id,
     username: user.username,
     displayName: user.displayName,
-    avatarUrl: user.avatarUrl,
-    verified: user.verified,
+    avatarUrl: user.avatarUrl ?? null,
+    verified: user.verified === 1 || user.verified === true,
   }
 }
 
-// ── Post ──────────────────────────────────────
-export async function serializePost(
-  post: any,
-  currentUserId?: string | null
-): Promise<PostDTO> {
-  const [likeCount, commentCount, repostCount, bookmarkCount] = await Promise.all([
-    db.like.count({ where: { postId: post.id } }),
-    db.post.count({ where: { replyToId: post.id } }),
-    db.repost.count({ where: { postId: post.id } }),
-    db.bookmark.count({ where: { postId: post.id } }),
-  ])
+// ── Post ─────────────────────────────────────────────────────────────────────
 
-  let liked = false
-  let bookmarked = false
-  let reposted = false
-  if (currentUserId) {
-    ;[liked, bookmarked, reposted] = await Promise.all([
-      db.like.findUnique({ where: { postId_userId: { postId: post.id, userId: currentUserId } } }).then(Boolean),
-      db.bookmark.findUnique({ where: { postId_userId: { postId: post.id, userId: currentUserId } } }).then(Boolean),
-      db.repost.findUnique({ where: { postId_userId: { postId: post.id, userId: currentUserId } } }).then(Boolean),
-    ])
-  }
+export interface MediaRow {
+  id: string
+  postId: string
+  url: string
+  type: string
+  ord: number
+}
 
-  let quotePost: PostDTO | null = null
-  if (post.quotePost) {
-    quotePost = await serializePost(post.quotePost, currentUserId)
-  }
+/** A post row joined with its author, before counts are resolved. */
+export interface PostRecord {
+  id: string
+  authorId: string
+  content: string
+  replyToId: string | null
+  quotePostId: string | null
+  createdAt: string
+  author: AuthorRow
+  media: MediaRow[]
+}
 
-  let replyTo: PostDTO | null = null
-  if (post.replyTo) {
-    replyTo = await serializePost(post.replyTo, currentUserId)
-  }
+/** Per-post counters and the current viewer's interaction flags. */
+export interface PostAggregates {
+  likeCount: number
+  commentCount: number
+  repostCount: number
+  bookmarkCount: number
+  liked: boolean
+  bookmarked: boolean
+  reposted: boolean
+}
 
+export const EMPTY_POST_AGGREGATES: PostAggregates = {
+  likeCount: 0,
+  commentCount: 0,
+  repostCount: 0,
+  bookmarkCount: 0,
+  liked: false,
+  bookmarked: false,
+  reposted: false,
+}
+
+function toMedia(rows: MediaRow[] | undefined): PostMediaDTO[] {
+  if (!rows || rows.length === 0) return []
+  return rows.map((m) => ({ id: m.id, url: m.url, type: m.type, order: m.ord }))
+}
+
+export function buildPostDTO(
+  record: PostRecord,
+  aggregates: Partial<PostAggregates> = {},
+  nested?: { quotePost?: PostDTO | null; replyTo?: PostDTO | null },
+): PostDTO {
+  const agg = { ...EMPTY_POST_AGGREGATES, ...aggregates }
   return {
-    id: post.id,
-    content: post.content,
-    createdAt: post.createdAt instanceof Date ? post.createdAt.toISOString() : post.createdAt,
-    author: toAuthor(post.author),
-    media: (post.media ?? []).map((m: any) => ({
-      id: m.id,
-      url: m.url,
-      type: m.type,
-      order: m.order,
-    })),
-    replyToId: post.replyToId ?? null,
-    quotePostId: post.quotePostId ?? null,
-    likeCount,
-    commentCount,
-    repostCount,
-    bookmarkCount,
-    liked,
-    bookmarked,
-    reposted,
-    quotePost,
-    replyTo,
+    id: record.id,
+    content: record.content,
+    createdAt: record.createdAt,
+    author: toAuthor(record.author),
+    media: toMedia(record.media),
+    replyToId: record.replyToId ?? null,
+    quotePostId: record.quotePostId ?? null,
+    likeCount: agg.likeCount,
+    commentCount: agg.commentCount,
+    repostCount: agg.repostCount,
+    bookmarkCount: agg.bookmarkCount,
+    liked: agg.liked,
+    bookmarked: agg.bookmarked,
+    reposted: agg.reposted,
+    quotePost: nested?.quotePost ?? null,
+    replyTo: nested?.replyTo ?? null,
   }
 }
 
-// Standard post include for fetching with relations
-export const POST_INCLUDE = {
-  author: {
-    select: {
-      id: true,
-      username: true,
-      displayName: true,
-      avatarUrl: true,
-      verified: true,
-    },
-  },
-  media: { orderBy: { order: 'asc' as const } },
-  quotePost: {
-    include: {
-      author: {
-        select: { id: true, username: true, displayName: true, avatarUrl: true, verified: true },
-      },
-      media: { orderBy: { order: 'asc' as const } },
-    },
-  },
-  replyTo: {
-    include: {
-      author: {
-        select: { id: true, username: true, displayName: true, avatarUrl: true, verified: true },
-      },
-      media: { orderBy: { order: 'asc' as const } },
-    },
-  },
-} as const
+// ── Profile ──────────────────────────────────────────────────────────────────
 
-// ── Profile ───────────────────────────────────
-export async function serializeProfile(
-  user: any,
-  currentUserId?: string | null
-): Promise<ProfileDTO> {
-  const [followersCount, followingCount, postsCount] = await Promise.all([
-    db.follow.count({ where: { followingId: user.id } }),
-    db.follow.count({ where: { followerId: user.id } }),
-    db.post.count({ where: { authorId: user.id, replyToId: null } }),
-  ])
+export interface ProfileRow {
+  id: string
+  username: string
+  displayName: string
+  bio: string | null
+  website: string | null
+  location: string | null
+  avatarUrl: string | null
+  coverUrl: string | null
+  verified: number | boolean
+  role: string
+  createdAt: string
+}
 
-  let isFollowing = false
-  if (currentUserId && currentUserId !== user.id) {
-    isFollowing = await db.follow
-      .findUnique({
-        where: {
-          followerId_followingId: { followerId: currentUserId, followingId: user.id },
-        },
-      })
-      .then(Boolean)
-  }
+export interface ProfileAggregates {
+  followersCount: number
+  followingCount: number
+  postsCount: number
+  isFollowing: boolean
+  isSelf: boolean
+}
 
+export function buildProfileDTO(
+  user: ProfileRow,
+  aggregates: Partial<ProfileAggregates> = {},
+  currentUserId?: string | null,
+): ProfileDTO {
   return {
     id: user.id,
     username: user.username,
@@ -147,117 +150,143 @@ export async function serializeProfile(
     location: user.location ?? null,
     avatarUrl: user.avatarUrl ?? null,
     coverUrl: user.coverUrl ?? null,
-    verified: user.verified,
+    verified: user.verified === 1 || user.verified === true,
     role: user.role,
-    createdAt: user.createdAt instanceof Date ? user.createdAt.toISOString() : user.createdAt,
-    followersCount,
-    followingCount,
-    postsCount,
-    isFollowing,
-    isSelf: currentUserId === user.id,
+    createdAt: user.createdAt,
+    followersCount: aggregates.followersCount ?? 0,
+    followingCount: aggregates.followingCount ?? 0,
+    postsCount: aggregates.postsCount ?? 0,
+    isFollowing: aggregates.isFollowing ?? false,
+    isSelf: currentUserId != null && currentUserId === user.id,
   }
 }
 
-// ── Notification ──────────────────────────────
-export async function serializeNotification(n: any): Promise<NotificationDTO> {
+/** Aggregates for many profiles at once, so profile lists don't N+1. */
+export interface ProfileAggregateMap {
+  followersCount: Map<string, number>
+  followingCount: Map<string, number>
+  postsCount: Map<string, number>
+  isFollowing: Set<string>
+}
+
+export function buildProfileDTOs(
+  users: ProfileRow[],
+  agg: ProfileAggregateMap,
+  currentUserId?: string | null,
+): ProfileDTO[] {
+  return users.map((user) =>
+    buildProfileDTO(
+      user,
+      {
+        followersCount: agg.followersCount.get(user.id) ?? 0,
+        followingCount: agg.followingCount.get(user.id) ?? 0,
+        postsCount: agg.postsCount.get(user.id) ?? 0,
+        isFollowing: agg.isFollowing.has(user.id),
+      },
+      currentUserId,
+    ),
+  )
+}
+
+// ── Notification ─────────────────────────────────────────────────────────────
+
+export interface NotificationRow {
+  id: string
+  type: string
+  read: number | boolean
+  createdAt: string
+  actor: AuthorRow
+  post: { id: string; content: string } | null
+}
+
+export function buildNotificationDTO(n: NotificationRow): NotificationDTO {
   return {
     id: n.id,
     type: n.type,
-    read: n.read,
-    createdAt: n.createdAt instanceof Date ? n.createdAt.toISOString() : n.createdAt,
+    read: n.read === 1 || n.read === true,
+    createdAt: n.createdAt,
     actor: toAuthor(n.actor),
-    post: n.postId
-      ? { id: n.post.id, content: n.post.content }
-      : null,
+    // `post` is null when the referenced post was deleted. The old code
+    // dereferenced it unconditionally whenever `postId` was set, which turned a
+    // single deleted post into a permanent 500 on the whole notifications feed.
+    post: n.post ?? null,
   }
 }
 
-export const NOTIFICATION_INCLUDE = {
-  actor: {
-    select: { id: true, username: true, displayName: true, avatarUrl: true, verified: true },
-  },
-  post: { select: { id: true, content: true } },
-} as const
+// ── Conversation ─────────────────────────────────────────────────────────────
 
-// ── Conversation ──────────────────────────────
-export async function serializeConversation(
-  conv: any,
-  currentUserId: string
-): Promise<ConversationDTO> {
-  const lastMessage = conv.messages?.[0] ?? null
-  // unread = messages after my lastReadAt, not sent by me
-  const myMembership = conv.members?.find((m: any) => m.userId === currentUserId)
-  let unreadCount = 0
-  if (myMembership && conv.messages) {
-    unreadCount = conv.messages.filter(
-      (m: any) =>
-        m.senderId !== currentUserId &&
-        new Date(m.createdAt) > new Date(myMembership.lastReadAt)
-    ).length
-  }
+export interface ConversationMemberRow {
+  userId: string
+  lastReadAt: string
+  user: AuthorRow
+}
 
+export interface ConversationRow {
+  id: string
+  type: string
+  name: string | null
+  updatedAt: string
+  members: ConversationMemberRow[]
+  lastMessage: {
+    id: string
+    conversationId: string
+    senderId: string
+    content: string
+    createdAt: string
+  } | null
+  unreadCount: number
+}
+
+export function buildConversationDTO(
+  conv: ConversationRow,
+  currentUserId: string,
+): ConversationDTO {
   return {
     id: conv.id,
     type: conv.type,
     name: conv.name ?? null,
-    lastMessage: lastMessage
-      ? {
-          id: lastMessage.id,
-          conversationId: conv.id,
-          senderId: lastMessage.senderId,
-          content: lastMessage.content,
-          createdAt: lastMessage.createdAt instanceof Date ? lastMessage.createdAt.toISOString() : lastMessage.createdAt,
-        }
-      : null,
-    members: (conv.members ?? [])
-      .filter((m: any) => m.userId !== currentUserId)
-      .map((m: any) => toAuthor(m.user)),
-    unreadCount,
+    lastMessage: conv.lastMessage ?? null,
+    members: conv.members.filter((m) => m.userId !== currentUserId).map((m) => toAuthor(m.user)),
+    unreadCount: conv.unreadCount ?? 0,
   }
 }
 
-export const CONVERSATION_INCLUDE = {
-  members: {
-    include: {
-      user: {
-        select: { id: true, username: true, displayName: true, avatarUrl: true, verified: true },
-      },
-    },
-  },
-  messages: {
-    orderBy: { createdAt: 'desc' as const },
-    take: 1,
-  },
-} as const
+// ── Message ──────────────────────────────────────────────────────────────────
 
-// ── Message ───────────────────────────────────
-export function serializeMessage(m: any): MessageDTO {
+export function buildMessageDTO(m: {
+  id: string
+  conversationId: string
+  senderId: string
+  content: string
+  createdAt: string
+}): MessageDTO {
   return {
     id: m.id,
     conversationId: m.conversationId,
     senderId: m.senderId,
     content: m.content,
-    createdAt: m.createdAt instanceof Date ? m.createdAt.toISOString() : m.createdAt,
+    createdAt: m.createdAt,
   }
 }
 
-// ── Community ─────────────────────────────────
-export async function serializeCommunity(
-  c: any,
-  currentUserId?: string | null
-): Promise<CommunityDTO> {
-  const membersCount = await db.communityMember.count({ where: { communityId: c.id } })
-  let isMember = false
-  let role: string | null = null
-  if (currentUserId) {
-    const membership = await db.communityMember.findUnique({
-      where: { communityId_userId: { communityId: c.id, userId: currentUserId } },
-    })
-    if (membership) {
-      isMember = true
-      role = membership.role
-    }
-  }
+// ── Community ────────────────────────────────────────────────────────────────
+
+export function buildCommunityDTO(
+  c: {
+    id: string
+    name: string
+    slug: string
+    description: string | null
+    coverUrl: string | null
+    createdAt: string
+    owner: AuthorRow
+  },
+  membership: { membersCount: number; isMember: boolean; role: string | null } = {
+    membersCount: 0,
+    isMember: false,
+    role: null,
+  },
+): CommunityDTO {
   return {
     id: c.id,
     name: c.name,
@@ -265,15 +294,9 @@ export async function serializeCommunity(
     description: c.description ?? null,
     coverUrl: c.coverUrl ?? null,
     owner: toAuthor(c.owner),
-    membersCount,
-    isMember,
-    role,
-    createdAt: c.createdAt instanceof Date ? c.createdAt.toISOString() : c.createdAt,
+    membersCount: membership.membersCount ?? 0,
+    isMember: membership.isMember ?? false,
+    role: membership.role ?? null,
+    createdAt: c.createdAt,
   }
 }
-
-export const COMMUNITY_INCLUDE = {
-  owner: {
-    select: { id: true, username: true, displayName: true, avatarUrl: true, verified: true },
-  },
-} as const

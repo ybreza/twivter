@@ -1,28 +1,23 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
+import { notFoundError, ok, withErrorHandler } from '@/lib/api'
 import { requireUser } from '@/lib/auth'
-import { forbidden, notFound, withErrorHandler, ok } from '@/lib/api'
+import { markConversationRead } from '@/lib/data/conversations'
 
-// POST /api/conversations/[id]/read — mark all messages in the conversation as
-// read by the current user (updates `ConversationMember.lastReadAt`).
-export const POST = withErrorHandler(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+// POST /api/conversations/[id]/read — mark every message in the conversation as
+// read for the current user (updates `ConversationMember.lastReadAt`, which is
+// also what the unread badge aggregates on).
+// Returns { success: true }
+//
+// The old handler looked the membership up twice — once to 403, once to update —
+// and only then checked that the conversation existed.
+export const POST = withErrorHandler(async (req, ctx) => {
   const user = await requireUser()
-  const { id } = await ctx.params
+  const params = await ctx.params
+  const raw = params.id
+  const conversationId = Array.isArray(raw) ? raw[0] : raw
+  if (!conversationId) throw notFoundError('Percakapan tidak ditemukan')
 
-  const membership = await db.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
-    select: { id: true },
-  })
-  if (!membership) return forbidden('Anda bukan anggota percakapan ini')
-
-  const conv = await db.conversation.findUnique({ where: { id }, select: { id: true } })
-  if (!conv) return notFound('Percakapan tidak ditemukan')
-
-  await db.conversationMember.update({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
-    data: { lastReadAt: new Date() },
-  })
+  // Throws 403 for a non-member; updates in a single statement.
+  await markConversationRead(conversationId, user.id)
 
   return ok({ success: true })
 })
-// touched 1786945215

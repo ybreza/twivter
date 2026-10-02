@@ -1,7 +1,6 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
 import {
   Home,
   Compass,
@@ -20,7 +19,6 @@ import {
   Laptop,
   Users,
 } from 'lucide-react'
-import Link from 'next/link'
 import { useAuthStore, useViewStore, useThemeStore, type ViewName } from '@/stores/app-store'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -34,8 +32,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
-import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet'
-import { TwivterLogo, TwivterWordmark } from '@/components/twivter-logo'
+import { TwivterLogo } from '@/components/twivter-logo'
 import { ComposeDialog } from '@/components/post/compose-dialog'
 import { toast } from 'sonner'
 
@@ -58,7 +55,8 @@ const navItems: NavItem[] = [
 
 export function AppShell({ children, rightSidebar }: { children: React.ReactNode; rightSidebar?: React.ReactNode }) {
   const user = useAuthStore((s) => s.user)
-  const { view, navigate, searchQuery, setSearchQuery } = useViewStore()
+  const view = useViewStore((s) => s.view)
+  const navigate = useViewStore((s) => s.navigate)
   const theme = useThemeStore((s) => s.theme)
   const setTheme = useThemeStore((s) => s.setTheme)
   const [composeOpen, setComposeOpen] = useState(false)

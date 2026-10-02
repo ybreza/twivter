@@ -5,10 +5,11 @@ import { ImagePlus, X, Smile, Calendar, MapPin, Loader2, Globe } from 'lucide-re
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { Progress } from '@/components/ui/progress'
-import { cn, validateImageFile } from '@/lib/utils'
+import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/app-store'
 import { UserAvatar } from '@/components/user-avatar'
 import { toast } from 'sonner'
+import { useImageUpload } from '@/hooks/use-image-upload'
 import type { PostDTO } from '@/lib/types'
 
 interface PostComposerProps {
@@ -20,6 +21,7 @@ interface PostComposerProps {
 }
 
 const MAX_CHARS = 280
+const MAX_MEDIA = 4
 
 export function PostComposer({
   placeholder = "Apa yang sedang terjadi?",
@@ -30,53 +32,17 @@ export function PostComposer({
 }: PostComposerProps) {
   const user = useAuthStore((s) => s.user)
   const [content, setContent] = useState('')
-  const [media, setMedia] = useState<{ url: string; type: string; file?: File }[]>([])
-  const [uploading, setUploading] = useState(false)
-  const [uploadProgress, setUploadProgress] = useState(0)
   const [isPending, startTransition] = useTransition()
   const fileRef = useRef<HTMLInputElement>(null)
+
+  const { media, uploading, progress, handleFiles, removeMedia, reset } = useImageUpload({
+    bucket: 'posts',
+    max: MAX_MEDIA,
+  })
 
   const remaining = MAX_CHARS - content.length
   const overLimit = remaining < 0
   const canPost = content.trim().length > 0 && !overLimit && !uploading && !isPending
-
-  const handleFile = async (file: File) => {
-    const err = validateImageFile(file, 5)
-    if (err) {
-      toast.error(err)
-      return
-    }
-    if (media.length >= 4) {
-      toast.error('Maksimal 4 gambar per post')
-      return
-    }
-    setUploading(true)
-    setUploadProgress(0)
-    try {
-      const formData = new FormData()
-      formData.append('file', file)
-      formData.append('bucket', 'posts')
-      // fake progress
-      const interval = setInterval(() => {
-        setUploadProgress((p) => Math.min(p + 10, 90))
-      }, 80)
-      const res = await fetch('/api/upload', { method: 'POST', body: formData })
-      clearInterval(interval)
-      setUploadProgress(100)
-      if (!res.ok) throw new Error('Upload gagal')
-      const data = await res.json()
-      setMedia((prev) => [...prev, { url: data.url, type: 'image' }])
-    } catch (e) {
-      toast.error('Gagal upload gambar')
-    } finally {
-      setUploading(false)
-      setTimeout(() => setUploadProgress(0), 500)
-    }
-  }
-
-  const removeMedia = (idx: number) => {
-    setMedia((prev) => prev.filter((_, i) => i !== idx))
-  }
 
   const submit = async () => {
     if (!canPost) return
@@ -98,7 +64,7 @@ export function PostComposer({
         const data = await res.json()
         toast.success(replyTo ? 'Balasan terkirim!' : 'Post terkirim! 🎉')
         setContent('')
-        setMedia([])
+        reset()
         onPosted?.(data.post)
       } catch (e: any) {
         toast.error(e.message || 'Gagal membuat post')
@@ -151,7 +117,7 @@ export function PostComposer({
 
         {uploading && (
           <div className="mt-2">
-            <Progress value={uploadProgress} className="h-1" />
+            <Progress value={progress} className="h-1" />
           </div>
         )}
 
@@ -165,8 +131,9 @@ export function PostComposer({
               multiple
               className="hidden"
               onChange={(e) => {
-                const files = Array.from(e.target.files ?? [])
-                files.forEach(handleFile)
+                // The hook applies the 4-image cap against a live ref, so
+                // selecting 8 files at once still only attaches the first 4.
+                void handleFiles(Array.from(e.target.files ?? []))
                 e.target.value = ''
               }}
             />

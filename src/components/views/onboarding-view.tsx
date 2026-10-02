@@ -33,8 +33,9 @@ import { apiPost } from '@/lib/hooks'
 import type { CurrentUser } from '@/stores/app-store'
 import { INTEREST_OPTIONS } from '@/lib/types'
 import { useApi } from '@/lib/hooks'
+import { useImageUpload } from '@/hooks/use-image-upload'
 import { formatCount } from '@/lib/api'
-import { cn, validateImageFile } from '@/lib/utils'
+import { cn } from '@/lib/utils'
 
 // Suggestion type returned by /api/explore/suggestions
 interface SuggestionUser {
@@ -86,7 +87,6 @@ export function OnboardingView() {
   const [followedIds, setFollowedIds] = useState<Set<string>>(new Set())
 
   const [submitting, setSubmitting] = useState(false)
-  const [uploadingAvatar, setUploadingAvatar] = useState(false)
   const [direction, setDirection] = useState<1 | -1>(1)
 
   // ── Username live check (debounced) ────────────
@@ -159,28 +159,45 @@ export function OnboardingView() {
 
   // ── Avatar upload ──────────────────────────────
   const avatarInputRef = useRef<HTMLInputElement>(null)
+  const avatarUrlRef = useRef<string | null>(user?.avatarUrl ?? null)
+  // `replaceMedia` is referentially stable, so it is safe as an effect
+  // dependency (the hook object itself is recreated on every render).
+  const {
+    uploading: uploadingAvatar,
+    progress: uploadProgress,
+    handleFiles: handleAvatarFiles,
+    replaceMedia,
+  } = useImageUpload({
+    bucket: 'avatars',
+    max: 1,
+    onChange: (media) => {
+      const url = media[0]?.url ?? null
+      avatarUrlRef.current = url
+      setAvatarUrl(url)
+    },
+  })
+
+  // Keep the uploaded image in sync with the user record on first mount.
+  useEffect(() => {
+    avatarUrlRef.current = user?.avatarUrl ?? null
+    replaceMedia(user?.avatarUrl ? [{ url: user.avatarUrl, type: 'image' }] : [])
+  }, [user?.avatarUrl, replaceMedia])
 
   async function handleAvatarChange(file: File | undefined) {
     if (!file) return
-    const err = validateImageFile(file, 5)
-    if (err) {
-      toast.error(err)
-      return
-    }
-    setUploadingAvatar(true)
-    try {
-      const formData = new FormData()
-      formData.append('file', file)
-      formData.append('bucket', 'avatars')
-      const res = await fetch('/api/upload', { method: 'POST', body: formData })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Upload gagal')
-      setAvatarUrl(data.url)
+    // Resizing to WebP happens in the browser; the hook uploads the result and
+    // drives the progress bar.
+    const before = avatarUrlRef.current
+    // Single slot: free it first, otherwise the hook reports the slot as full.
+    replaceMedia([])
+    avatarUrlRef.current = null
+    await handleAvatarFiles([file])
+    if (avatarUrlRef.current) {
       toast.success('Foto profil diupload!')
-    } catch (e: any) {
-      toast.error(e?.message || 'Gagal upload foto')
-    } finally {
-      setUploadingAvatar(false)
+    } else if (before) {
+      // Upload rejected — put the previous photo back.
+      avatarUrlRef.current = before
+      replaceMedia([{ url: before, type: 'image' }])
     }
   }
 
@@ -543,10 +560,20 @@ export function OnboardingView() {
                       <input
                         ref={avatarInputRef}
                         type="file"
-                        accept="image/jpeg,image/png,image/webp,image/gif"
+                        accept="image/jpeg,image/png,image/webp,image/gif,image/avif"
                         className="hidden"
                         onChange={(e) => handleAvatarChange(e.target.files?.[0])}
                       />
+
+                      {uploadingAvatar && (
+                        <div className="h-1.5 w-48 max-w-full rounded-full bg-muted overflow-hidden">
+                          <motion.div
+                            className="h-full bg-gradient-to-r from-blue-500 to-purple-500"
+                            animate={{ width: `${uploadProgress}%` }}
+                            transition={{ duration: 0.2 }}
+                          />
+                        </div>
+                      )}
 
                       <div className="flex flex-col items-center gap-3">
                         <Button
@@ -578,7 +605,7 @@ export function OnboardingView() {
                             type="button"
                             variant="ghost"
                             size="sm"
-                            onClick={() => setAvatarUrl(null)}
+                            onClick={() => replaceMedia([])}
                             className="text-muted-foreground"
                           >
                             Hapus foto
@@ -587,7 +614,8 @@ export function OnboardingView() {
                       </div>
 
                       <p className="text-xs text-muted-foreground text-center max-w-xs">
-                        Format: JPG, PNG, WEBP, GIF. Maks 5MB. Direkomendasikan foto persegi 400×400.
+                        Format: JPG, PNG, WEBP, GIF. Maks 12MB. Direkomendasikan foto
+                        persegi 400×400. Gambar otomatis dikompres ke WebP.
                       </p>
                     </div>
                   )}

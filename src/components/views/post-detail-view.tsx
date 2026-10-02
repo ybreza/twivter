@@ -13,7 +13,6 @@ import {
 } from '@/components/shared-states'
 import { useViewStore } from '@/stores/app-store'
 import type { PostDTO } from '@/lib/types'
-import { toast } from 'sonner'
 
 interface CommentsResponse {
   posts: PostDTO[]
@@ -31,37 +30,44 @@ export function PostDetailView() {
   const [postError, setPostError] = useState<string | null>(null)
   const [notFound, setNotFound] = useState(false)
 
-  useEffect(() => {
+  // Extracted so the error state's retry re-runs this instead of
+  // `location.reload()`, which reset the SPA router back to the home view.
+  const fetchPost = useCallback(async (signal?: AbortSignal) => {
     if (!postUrl) return
-    let cancelled = false
     setLoadingPost(true)
     setPostError(null)
     setNotFound(false)
     setPost(null)
-    ;(async () => {
-      try {
-        const res = await fetch(postUrl, { cache: 'no-store' })
-        if (cancelled) return
-        if (res.status === 404) {
-          setNotFound(true)
-          return
-        }
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}))
-          throw new Error(err.error || `HTTP ${res.status}`)
-        }
-        const data = await res.json()
-        if (!cancelled) setPost(data.post)
-      } catch (e: any) {
-        if (!cancelled) setPostError(e.message || 'Gagal memuat post')
-      } finally {
-        if (!cancelled) setLoadingPost(false)
+    try {
+      const res = await fetch(postUrl, { cache: 'no-store', signal })
+      if (res.status === 404) {
+        setNotFound(true)
+        return
       }
-    })()
-    return () => {
-      cancelled = true
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.error || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      setPost(data.post)
+    } catch (e: any) {
+      if (e?.name === 'AbortError') return
+      setPostError(e.message || 'Gagal memuat post')
+    } finally {
+      setLoadingPost(false)
     }
   }, [postUrl])
+
+  // The abort on cleanup drops an in-flight response for a post the user has
+  // already navigated away from.
+  useEffect(() => {
+    if (!postUrl) return
+    const controller = new AbortController()
+    fetchPost(controller.signal).catch(() => {
+      /* handled inside fetchPost */
+    })
+    return () => controller.abort()
+  }, [postUrl, fetchPost])
 
   // ── Comments ────────────────────────────────────
   const [comments, setComments] = useState<PostDTO[]>([])
@@ -70,6 +76,9 @@ export function PostDetailView() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [commentsError, setCommentsError] = useState<string | null>(null)
   const sentinelRef = useRef<HTMLDivElement | null>(null)
+
+  // Marks the in-flight request stale when the post (or the view) changes.
+  const ignoreCommentsRef = useRef(false)
 
   const fetchComments = useCallback(
     async (cursor: string | null, mode: 'initial' | 'more') => {
@@ -85,17 +94,21 @@ export function PostDetailView() {
           throw new Error(err.error || `HTTP ${res.status}`)
         }
         const data: CommentsResponse = await res.json()
+        if (ignoreCommentsRef.current) return
         if (mode === 'more') {
-          setComments((prev) => [...prev, ...data.posts])
+          setComments((prev) => [...prev, ...(data.posts ?? [])])
         } else {
-          setComments(data.posts)
+          setComments(data.posts ?? [])
         }
-        setNextCursor(data.nextCursor)
+        setNextCursor(data.nextCursor ?? null)
       } catch (e: any) {
+        if (ignoreCommentsRef.current) return
         setCommentsError(e.message || 'Gagal memuat komentar')
       } finally {
-        setLoadingComments(false)
-        setLoadingMore(false)
+        if (!ignoreCommentsRef.current) {
+          setLoadingComments(false)
+          setLoadingMore(false)
+        }
       }
     },
     [postId]
@@ -103,7 +116,13 @@ export function PostDetailView() {
 
   useEffect(() => {
     if (!postId) return
-    fetchComments(null, 'initial')
+    ignoreCommentsRef.current = false
+    fetchComments(null, 'initial').catch(() => {
+      /* handled inside fetchComments */
+    })
+    return () => {
+      ignoreCommentsRef.current = true
+    }
   }, [postId, fetchComments])
 
   // ── Infinite scroll for comments ────────────────
@@ -142,8 +161,8 @@ export function PostDetailView() {
   }
 
   const handleDeletePost = () => {
-    // Navigates back home after deletion
-    toast.success('Post dihapus')
+    // Navigates back home after deletion. `PostCard` already toasts
+    // "Post dihapus", so this must not duplicate it.
     navigate('home')
   }
 
@@ -162,7 +181,10 @@ export function PostDetailView() {
           action={{ label: 'Kembali ke Home', onClick: () => navigate('home') }}
         />
       ) : postError ? (
-        <ErrorState message={postError} onRetry={() => location.reload()} />
+        <ErrorState
+          message={postError}
+          onRetry={() => fetchPost().catch(() => undefined)}
+        />
       ) : post ? (
         <>
           {/* Make the parent post non-clickable wrapper to avoid nav loop */}
@@ -198,7 +220,7 @@ export function PostDetailView() {
             ) : commentsError ? (
               <ErrorState
                 message={commentsError}
-                onRetry={() => fetchComments(null, 'initial')}
+                onRetry={() => fetchComments(null, 'initial').catch(() => undefined)}
               />
             ) : comments.length === 0 ? (
               <EmptyState

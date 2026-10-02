@@ -1,163 +1,104 @@
-# Twivter 🐦
+# Twivter
 
-Platform microblogging bergaya Twitter/X yang dibangun full-stack dengan
-**Next.js 16** (App Router), **TypeScript**, **Prisma** (SQLite/PostgreSQL),
-dan **socket.io** untuk realtime Direct Messages.
+A Twitter/X-style social platform, running entirely on Cloudflare.
 
-> **Quick links:**
-> - 📗 [**`DEPLOY-WINDOWS.md`**](./DEPLOY-WINDOWS.md) — Panduan deploy untuk **Windows 10** (utama untuk Anda)
-> - 📘 [**`DEPLOY.md`**](./DEPLOY.md) — Panduan deploy umum (Linux/macOS + Vercel + Railway)
-> - 📄 [**`upload/PRD_Twivter.md`**](./upload/PRD_Twivter.md) — Product Requirements Document
-> - 📝 [**`worklog.md`**](./worklog.md) — Log pengembangan lengkap
+| Concern | Choice |
+| --- | --- |
+| Runtime | Cloudflare Workers (Next.js 16 via OpenNext) |
+| Database | Cloudflare D1 (SQLite-compatible) |
+| Media storage | Cloudflare R2 |
+| Realtime chat | Cloudflare Durable Objects + WebSocket Hibernation |
+| Auth | bcrypt password hashing + server-side sessions in D1, httpOnly cookie |
 
----
+There is no separate chat service, no object-storage provider, and no external
+database. `npm run deploy` produces one Worker.
 
-## Teknologi
+## Features
 
-| Komponen | Teknologi |
-|---|---|
-| Framework | Next.js 16 (App Router, Turbopack) |
-| Bahasa | TypeScript 5 |
-| Styling | Tailwind CSS 4 + shadcn/ui (New York) |
-| Database | Prisma ORM (SQLite dev / PostgreSQL prod) |
-| Auth | bcryptjs + jose JWT (httpOnly cookie) |
-| Realtime | socket.io (mini-service terpisah) |
-| State | Zustand (client) + TanStack Query (server) |
-| Runtime | Bun (recommended) atau Node.js ≥ 20 |
+- Auth: register, login, logout, session revocation, onboarding wizard
+- Feed: home (following), explore (all), bookmarks, cursor pagination
+- Posts: text up to 280 chars, up to 4 images, replies, quote posts
+- Interactions: like, repost, bookmark, reply — with counts and viewer flags
+- Profiles: cover/avatar, bio, website, location, interests, tabs, follow graph
+- Messaging: 1:1 and group DMs, live delivery, typing indicators, unread badges
+- Communities: browse, create, join/leave, member roles, owner management
+- Moderation: reports against users and posts, verification requests, admin
+  dashboard with 7-day growth chart
+- Settings: account, theme (light/dark/system), interests, notification and
+  privacy preferences
+- Search across posts, users and communities; trending hashtags
 
----
+## Quick start
 
-## Quick Start (Windows 10)
-
-```powershell
-# 1. Ekstrak twivter.zip ke C:\twivter
-cd C:\twivter
-
-# 2. Copy .env.example ke .env
-Copy-Item .env.example .env
-
-# 3. Install dependencies (utama + chat service)
+```bash
 bun install
-cd mini-services\chat-service; bun install; cd ..\..
+cp .dev.vars.example .dev.vars      # then fill in SESSION_SECRET
+bunx wrangler login                 # once
 
-# 4. Setup database + seed (skip jika db\custom.db sudah ada & ter-seed)
-bun run db:push
-bun run seed
-
-# 5. Jalankan DUA service di DUA terminal berbeda
-#    Terminal 1 (Next.js):
-bun run dev
-
-#    Terminal 2 (chat service):
-cd mini-services\chat-service; bun run dev
-
-# 6. Buka http://localhost:3000 di browser
-# 7. Login demo: yowanda@twivter.com / password123
+bun run db:local                    # create the local D1 schema
+bun run db:seed                     # load demo data
+bun run dev                         # http://localhost:3000
+bun run smoke                       # end-to-end API test suite (95 checks)
 ```
 
-📖 **Panduan lengkap step-by-step:** [`DEPLOY-WINDOWS.md`](./DEPLOY-WINDOWS.md)
+> Durable Objects are not loaded by `next dev`, so the chat WebSocket cannot
+> connect locally. The client falls back to polling every 5 seconds while the
+> socket is down, so messaging still works. Use `bun run preview` to exercise
+> realtime in the real Workers runtime.
 
----
+Demo accounts (all use password `password123`):
 
-## Struktur Project
+| Email | Role |
+| --- | --- |
+| `yowanda@twivter.com` | admin |
+| `sara@twivter.com` | user |
+| `bagus@twivter.com`, `maya@twivter.com`, `rizki@twivter.com`, `dewi@twivter.com`, `arif@twivter.com`, `nina@twivter.com` | user |
 
-```
-twivter/
-├── src/
-│   ├── app/                    # Next.js App Router
-│   │   ├── page.tsx            # Single-page app (view-switching)
-│   │   ├── layout.tsx          # Root layout (Inter font + Providers)
-│   │   ├── globals.css         # Tailwind + tema Twivter
-│   │   └── api/                # REST API routes
-│   │       ├── auth/           # login, register, logout, me
-│   │       ├── posts/          # CRUD posts + like/comment/repost/bookmark
-│   │       ├── profiles/       # profile + follow
-│   │       ├── conversations/  # DM list + messages
-│   │       ├── notifications/  # notifications list + read
-│   │       ├── communities/    # list + detail + join
-│   │       ├── admin/          # admin dashboard (users, reports, verifications)
-│   │       ├── explore/        # trending + suggestions
-│   │       ├── search/         # full-text search
-│   │       ├── onboarding/     # post-register onboarding
-│   │       ├── upload/         # image upload (avatar/cover/post)
-│   │       └── reports/        # submit report
-│   ├── components/             # React components
-│   │   ├── ui/                 # shadcn/ui component set
-│   │   ├── layout/             # app shell + sidebar
-│   │   ├── post/               # post card + composer
-│   │   ├── messages/           # DM UI + socket hook
-│   │   ├── profile/            # edit profile dialog
-│   │   └── views/              # view components (home, explore, dll)
-│   ├── lib/                    # utilities
-│   │   ├── auth.ts             # bcrypt + JWT session
-│   │   ├── db.ts               # Prisma client singleton
-│   │   ├── api.ts              # fetch helper
-│   │   ├── types.ts            # shared types
-│   │   ├── serialize.ts        # Prisma → JSON safe
-│   │   ├── hooks.ts            # generic React Query hooks
-│   │   └── utils.ts            # cn() + misc
-│   ├── hooks/                  # custom hooks
-│   └── stores/                 # Zustand stores
-│       └── app-store.ts        # auth + view router + theme
-├── prisma/
-│   └── schema.prisma           # 15 models: User, Post, Follow, dll
-├── scripts/
-│   └── seed.ts                 # demo data seeder
-├── mini-services/
-│   └── chat-service/           # socket.io mini-service (port 3003)
-│       ├── index.ts
-│       └── package.json
-├── public/                     # static assets
-├── upload/
-│   └── PRD_Twivter.md          # original PRD
-├── db/
-│   └── custom.db               # SQLite database (pre-seeded)
-├── .env.example                # environment template
-├── package.json
-├── next.config.ts
-├── tsconfig.json
-├── tailwind.config.ts
-├── components.json             # shadcn/ui config
-├── Caddyfile                   # dev gateway (opsional, untuk sandbox)
-├── DEPLOY.md                   # general deploy guide
-└── DEPLOY-WINDOWS.md           # Windows 10 deploy guide ← LIHAT INI
+## Deploying
+
+```bash
+bunx wrangler d1 migrations apply twivter-db --remote
+bunx wrangler secret put SESSION_SECRET
+bunx wrangler secret put CHAT_INTERNAL_SECRET
+bun run deploy
 ```
 
----
+See [docs/DEPLOY.md](docs/DEPLOY.md) for the full walkthrough and
+[docs/DATA-LAYER.md](docs/DATA-LAYER.md) for the database contract every route
+follows.
 
-## Fitur
+## Project layout
 
-- ✅ **Auth**: register, login, logout, session via httpOnly cookie
-- ✅ **Onboarding**: setup username, avatar, bio, minat setelah register
-- ✅ **Posting**: text + multiple images, reply, quote
-- ✅ **Interaksi**: like, comment, repost, bookmark
-- ✅ **Sosial**: follow/unfollow, followers/following list
-- ✅ **Discovery**: explore (trending), search (full-text), suggestions
-- ✅ **Communities**: list, detail, join/leave
-- ✅ **Notifications**: like, comment, follow, mention, mark as read
-- ✅ **Direct Messages**: realtime via socket.io, typing indicator, read receipt
-- ✅ **Profile**: edit profile (avatar, cover, bio, location, website)
-- ✅ **Admin**: dashboard untuk moderasi user, reports, verifications
-- ✅ **Dark Mode**: toggle via next-themes
-- ✅ **Responsive**: mobile-first, sidebar collapsible
+```
+migrations/            D1 schema migrations
+scripts/seed.mjs       demo data, applied via `wrangler d1 execute --file`
+src/cloudflare/        Durable Object (ChatUser)
+src/lib/               db client, auth, validation, storage, DTO builders
+src/lib/data/          repositories: posts, users, conversations, communities…
+src/app/api/           route handlers
+src/components/        SPA views (the app is a single `/` route)
+worker.ts              Worker entry: OpenNext handler + Durable Object
+```
 
----
+## Notable implementation details
 
-## Akun Demo
+**Sortable ids.** Primary keys are 9 base36 characters of millisecond timestamp
+plus 12 random characters (`src/lib/ids.ts`). Because ids sort chronologically,
+every paginated query uses a plain keyset cursor (`WHERE id < ? ORDER BY id`).
+Paginating on `createdAt` — what the previous version did — silently skipped or
+duplicated rows whenever two records shared a timestamp.
 
-| Email | Password | Role |
-|---|---|---|
-| `yowanda@twivter.com` | `password123` | Admin |
-| `budi@twivter.com` | `password123` | User |
-| `citra@twivter.com` | `password123` | User |
-| `dewi@twivter.com` | `password123` | User |
-| `eka@twivter.com` | `password123` | User |
-| `fajar@twivter.com` | `password123` | User |
-| `gita@twivter.com` | `password123` | User |
-| `hadi@twivter.com` | `password123` | User |
+**Fixed query counts.** A page of posts costs six queries regardless of page
+size: posts+author, media, all four counters in one `UNION ALL`, and three
+viewer-flag lookups. The previous serializer ran seven queries per post, so a
+20-post feed cost around 140 round-trips.
 
----
+**Client-side image processing.** `sharp` is a native module and cannot run on
+Workers. Images are decoded, downscaled and re-encoded to WebP in the browser
+(`src/lib/image.ts`) before being written to R2, so the Worker only validates
+and stores bytes.
 
-## Lisensi
-
-MIT — bebas dipakai, dimodifikasi, dan didistribusikan ulang.
+**Durable Objects over socket.io.** Each user has one `ChatUser` object holding
+their sockets, using the WebSocket Hibernation API so idle connections cost
+nothing. Messages are persisted over HTTP and then pushed by the server, so a
+client can never spoof delivery and a dropped socket cannot lose a message.

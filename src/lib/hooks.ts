@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 
 // Lightweight fetch hook for GET endpoints (no React Query to keep deps minimal in views)
 export function useApi<T>(url: string | null, options?: { deps?: any[]; skip?: boolean }) {
@@ -8,29 +8,55 @@ export function useApi<T>(url: string | null, options?: { deps?: any[]; skip?: b
   const [loading, setLoading] = useState(!options?.skip)
   const [error, setError] = useState<string | null>(null)
 
+  // Read inside `refetch` without making it a dependency, so a stable `refetch`
+  // identity is kept for consumers that put it in effect dependency arrays.
+  const urlRef = useRef(url)
+  urlRef.current = url
+
+  const abortRef = useRef<AbortController | null>(null)
+  // Set on unmount so no state update ever happens after the view is gone.
+  const ignoreRef = useRef(false)
+
   const refetch = useCallback(async () => {
-    if (!url) return
+    const target = urlRef.current
+    if (!target) return
     setLoading(true)
     setError(null)
+    // Cancels the previous request so a slow response for an old URL cannot
+    // land after the URL changed.
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
     try {
-      const res = await fetch(url, { cache: 'no-store' })
+      const res = await fetch(target, { cache: 'no-store', signal: controller.signal })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
         throw new Error(err.error || `HTTP ${res.status}`)
       }
       const json = await res.json()
+      if (ignoreRef.current || controller.signal.aborted) return
       setData(json)
     } catch (e: any) {
+      if (e?.name === 'AbortError') return
+      if (ignoreRef.current) return
       setError(e.message || 'Gagal memuat data')
     } finally {
-      setLoading(false)
+      if (!ignoreRef.current && !controller.signal.aborted) setLoading(false)
     }
-  }, [url])
+  }, [])
 
   useEffect(() => {
-    if (options?.skip) return
-    refetch()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    ignoreRef.current = false
+    // A new URL means the previous response describes a different resource.
+    setData(null)
+    if (options?.skip || !url) return
+    refetch().catch(() => {
+      /* handled inside refetch */
+    })
+    return () => {
+      ignoreRef.current = true
+      abortRef.current?.abort()
+    }
   }, [url, ...(options?.deps ?? [])])
 
   return { data, loading, error, refetch, setData }

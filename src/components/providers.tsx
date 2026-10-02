@@ -19,8 +19,16 @@ export function Providers({ children }: { children: React.ReactNode }) {
   )
 
   const theme = useThemeStore((s) => s.theme)
+  const hydrateTheme = useThemeStore((s) => s.hydrate)
   const setUser = useAuthStore((s) => s.setUser)
   const setLoading = useAuthStore((s) => s.setLoading)
+
+  // Restore the persisted theme choice before applying it. Without this the
+  // store always started at 'system' and the user's dark-mode pick was lost on
+  // every reload.
+  useEffect(() => {
+    hydrateTheme()
+  }, [hydrateTheme])
 
   // Apply theme on mount + listen to system changes
   useEffect(() => {

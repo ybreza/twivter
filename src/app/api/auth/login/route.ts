@@ -1,66 +1,41 @@
-import { db } from '@/lib/db'
+import { first } from '@/lib/db'
 import {
-  verifyPassword,
-  createSessionToken,
+  createSession,
+  loadCurrentUser,
   setSessionCookie,
-  getCurrentUser,
-  validateEmail,
-  validatePassword,
+  verifyPassword,
 } from '@/lib/auth'
-import {
-  ok,
-  badRequest,
-  unauthorized,
-  serverError,
-  withErrorHandler,
-  parseJson,
-} from '@/lib/api'
+import { ok, parseJson, unauthorizedError, withErrorHandler } from '@/lib/api'
+import { reqString } from '@/lib/validate'
 
-export const POST = withErrorHandler(async (req: Request) => {
-  const body = await parseJson<{ email?: string; password?: string }>(req)
+interface LoginUserRow {
+  id: string
+  email: string
+  passwordHash: string
+}
 
-  const email = (body.email ?? '').trim().toLowerCase()
-  const password = body.password ?? ''
+export const POST = withErrorHandler(async (req) => {
+  const body = await parseJson(req)
+  const email = reqString(body.email, 'email').trim().toLowerCase()
+  const password = reqString(body.password, 'password')
 
-  const emailErr = validateEmail(email)
-  if (emailErr) return badRequest(emailErr)
+  const row = await first<LoginUserRow>(
+    `SELECT id, email, passwordHash FROM User WHERE emailLower = ?`,
+    [email],
+  )
 
-  const passwordErr = validatePassword(password)
-  if (passwordErr) return badRequest(passwordErr)
-
-  const user = await db.user.findUnique({
-    where: { email },
-    select: {
-      id: true,
-      email: true,
-      username: true,
-      displayName: true,
-      passwordHash: true,
-      role: true,
-      onboarded: true,
-    },
-  })
-
-  if (!user) {
-    return unauthorized('Email atau password salah')
+  // Identical message and roughly identical work for both failure modes, so the
+  // endpoint cannot be used to enumerate registered addresses.
+  const invalid = unauthorizedError('Email atau password salah')
+  if (!row) {
+    // Burn a comparable amount of time so timing does not leak existence.
+    await verifyPassword(password, '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinv')
+    throw invalid
   }
+  if (!(await verifyPassword(password, row.passwordHash))) throw invalid
 
-  const valid = await verifyPassword(password, user.passwordHash)
-  if (!valid) {
-    return unauthorized('Email atau password salah')
-  }
-
-  try {
-    const token = await createSessionToken({
-      userId: user.id,
-      email: user.email,
-      username: user.username,
-    })
-    await setSessionCookie(token)
-
-    const currentUser = await getCurrentUser()
-    return ok({ user: currentUser })
-  } catch (err: any) {
-    return serverError('Gagal membuat sesi', err?.message)
-  }
+  const token = await createSession(row.id)
+  await setSessionCookie(token)
+  const user = await loadCurrentUser(row.id)
+  return ok({ user })
 })

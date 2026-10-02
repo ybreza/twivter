@@ -88,17 +88,46 @@ export const useViewStore = create<ViewState>((set) => ({
 }))
 
 // ── Theme (light/dark/system) ─────────────────
-type Theme = 'light' | 'dark' | 'system'
+export type Theme = 'light' | 'dark' | 'system'
+
+export const THEME_STORAGE_KEY = 'twivter-theme'
+
+function isTheme(value: unknown): value is Theme {
+  return value === 'light' || value === 'dark' || value === 'system'
+}
+
 interface ThemeState {
   theme: Theme
   setTheme: (t: Theme) => void
+  /** Reads the persisted choice. Called from an effect, never during render. */
+  hydrate: () => void
 }
 export const useThemeStore = create<ThemeState>((set) => ({
   theme: 'system',
   setTheme: (t) => {
-    if (typeof window !== 'undefined') localStorage.setItem('twivter-theme', t)
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(THEME_STORAGE_KEY, t)
+      } catch {
+        /* private mode / quota — the choice simply will not persist */
+      }
+    }
     set({ theme: t })
     applyTheme(t)
+  },
+  hydrate: () => {
+    // SSR-safe: `localStorage` only exists in the browser, and the effect that
+    // calls this never runs on the server.
+    if (typeof window === 'undefined') return
+    let stored: string | null = null
+    try {
+      stored = window.localStorage.getItem(THEME_STORAGE_KEY)
+    } catch {
+      stored = null
+    }
+    const theme = isTheme(stored) ? stored : 'system'
+    set({ theme })
+    applyTheme(theme)
   },
 }))
 

@@ -35,17 +35,60 @@ import {
   DialogClose,
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
-import { useChatSocket, IncomingMessagePayload } from '@/components/messages/use-chat-socket'
+import {
+  useChatSocket,
+  type ChatMessageEvent,
+  type ChatTypingEvent,
+  type ChatReadEvent,
+} from '@/components/messages/use-chat-socket'
 
 // Extended MessageDTO with optional sender info (returned by the API when
 // listing messages, included for group display).
 type ChatMessage = MessageDTO & { sender?: AuthorDTO }
 
+// Shapes of the two endpoints this view reads. `error` is present on every
+// worker error envelope, so it is checked before the payload is trusted.
+type ConversationResponse = { conversation?: ConversationDTO; error?: string }
+type MessagesResponse = { messages?: ChatMessage[]; error?: string }
+
+/**
+ * Merges two message lists by id.
+ *
+ * The transcript is fed from three sources — the initial fetch, a `POST` reply
+ * and live socket pushes — so the same message can legitimately arrive twice
+ * (the sender sees their own message in the POST response *and* in the echo /
+ * re-delivery after a reconnect). Ids are the only reliable identity, so every
+ * write path goes through here and de-duplicates on id. Entries already present
+ * win, because they may carry `sender` detail the re-fetch lacks.
+ */
+function mergeMessages(prev: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+  if (incoming.length === 0) return prev
+  const seen = new Set(prev.map((m) => m.id))
+  const merged = prev.slice()
+  for (const m of incoming) {
+    if (seen.has(m.id)) continue
+    seen.add(m.id)
+    merged.push(m)
+  }
+  // Newest last; `id` breaks ties so the order is stable across merges.
+  merged.sort(
+    (a, b) =>
+      new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime() ||
+      (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  )
+  return merged
+}
+
 // ───────────────────────────────────────────────
 // Top-level view
 // ───────────────────────────────────────────────
 export function MessagesView() {
-  const { conversationId, setConversation, navigate } = useViewStore()
+  // Selectors, not `useViewStore()`: a no-selector subscription re-runs this
+  // component on every store write, which meant every keystroke in the
+  // conversation search box re-rendered the whole view.
+  const conversationId = useViewStore((s) => s.conversationId)
+  const setConversation = useViewStore((s) => s.setConversation)
+  const navigate = useViewStore((s) => s.navigate)
   const user = useAuthStore((s) => s.user)
   const [refreshKey, setRefreshKey] = useState(0)
 
@@ -55,6 +98,14 @@ export function MessagesView() {
   )
 
   const conversations = data?.conversations ?? []
+
+  // Stable identity. This is passed down to `ChatWindow`, whose `markRead`
+  // callback depends on it; when it was an inline arrow a re-render produced a
+  // new function, which re-created `markRead`, which re-fired the mark-read
+  // effect, which refreshed the list, which re-rendered — forever.
+  const onConversationChanged = useCallback(() => {
+    setRefreshKey((k) => k + 1)
+  }, [])
 
   return (
     <div className="flex h-[calc(100dvh-7rem)] md:h-screen overflow-hidden">
@@ -105,11 +156,8 @@ export function MessagesView() {
         {conversationId ? (
           <ChatWindow
             conversationId={conversationId}
-            onBack={() => {
-              setConversation('' as any)
-              navigate('messages')
-            }}
-            onConversationChanged={() => setRefreshKey((k) => k + 1)}
+            onBack={() => navigate('messages')}
+            onConversationChanged={onConversationChanged}
           />
         ) : (
           <EmptyState
@@ -221,10 +269,8 @@ function ConversationList({
                 <span className="text-sm text-muted-foreground truncate flex-1">
                   {c.lastMessage ? (
                     <>
-                      {c.type === 'group' && c.lastMessage.senderId && (
-                        <span className="text-foreground/70">
-                          {c.lastMessage.senderId === currentUserId ? 'Anda: ' : ''}
-                        </span>
+                      {c.lastMessage.senderId === currentUserId && (
+                        <span className="text-foreground/70">Anda: </span>
                       )}
                       {c.lastMessage.content}
                     </>
@@ -301,7 +347,10 @@ function NewMessageButton({ onCreated }: { onCreated: (c: ConversationDTO) => vo
   const [results, setResults] = useState<ProfileDTO[]>([])
   const [creatingId, setCreatingId] = useState<string | null>(null)
 
-  // Debounced user search via /api/search?type=users
+  // Debounced user search via /api/search?type=users.
+  // `clearTimeout` alone only cancels a *pending* request: once the fetch is in
+  // flight the cleanup still returns, the promise settles and `setResults`
+  // fires after unmount. The abort controller plus `ignore` both close that gap.
   useEffect(() => {
     if (!open) return
     const t = q.trim()
@@ -310,19 +359,30 @@ function NewMessageButton({ onCreated }: { onCreated: (c: ConversationDTO) => vo
       return
     }
     setSearching(true)
+    let ignore = false
+    const controller = new AbortController()
     const id = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/search?type=users&q=${encodeURIComponent(t)}`)
+        const res = await fetch(`/api/search?type=users&q=${encodeURIComponent(t)}`, {
+          signal: controller.signal,
+        })
+        if (ignore) return
         if (!res.ok) throw new Error('Gagal mencari pengguna')
-        const json = await res.json()
+        const json = (await res.json()) as { users?: ProfileDTO[] }
+        if (ignore) return
         setResults(json.users ?? [])
       } catch (e: any) {
+        if (ignore || e?.name === 'AbortError') return
         toast.error(e.message || 'Gagal mencari pengguna')
       } finally {
-        setSearching(false)
+        if (!ignore) setSearching(false)
       }
     }, 300)
-    return () => clearTimeout(id)
+    return () => {
+      ignore = true
+      clearTimeout(id)
+      controller.abort()
+    }
   }, [q, open])
 
   const startWith = async (user: ProfileDTO) => {
@@ -464,21 +524,33 @@ function ChatWindow({
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const bottomRef = useRef<HTMLDivElement | null>(null)
 
+  // Ids already in the transcript. Mirrors `messages` so every write path can
+  // answer "have I seen this one?" synchronously — a flag set from inside a
+  // `setState` updater would be unreliable, since updaters may be deferred or
+  // run twice (StrictMode) and their side effects are discarded.
+  const seenIdsRef = useRef<Set<string>>(new Set())
+
   // ── Load conversation meta + messages ────────
   const loadAll = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      const [convRes, msgRes] = await Promise.all([
-        fetch(`/api/conversations/${conversationId}`).then((r) => r.json()),
-        fetch(`/api/conversations/${conversationId}/messages?limit=50`).then((r) => r.json()),
-      ])
+      const [convRes, msgRes] = (await Promise.all([
+        fetch(`/api/conversations/${conversationId}`).then((r) => r.json() as Promise<ConversationResponse>),
+        fetch(`/api/conversations/${conversationId}/messages?limit=50`).then(
+          (r) => r.json() as Promise<MessagesResponse>
+        ),
+      ])) as [ConversationResponse, MessagesResponse]
       if (mountedConvRef.current !== conversationId) return
       if (convRes.error) throw new Error(convRes.error)
       if (msgRes.error) throw new Error(msgRes.error)
+      const page = msgRes.messages ?? []
       setConvMeta(convRes.conversation ?? null)
-      setMembers((convRes.conversation?.members ?? []) as AuthorDTO[])
-      setMessages((msgRes.messages ?? []) as ChatMessage[])
+      setMembers(convRes.conversation?.members ?? [])
+      // Replaces the transcript wholesale: this is the authoritative page, so a
+      // message deleted server-side must not linger.
+      seenIdsRef.current = new Set(page.map((m) => m.id))
+      setMessages(page)
     } catch (e: any) {
       if (mountedConvRef.current !== conversationId) return
       setError(e.message || 'Gagal memuat percakapan')
@@ -491,72 +563,111 @@ function ChatWindow({
     loadAll()
   }, [loadAll])
 
+  // ── Re-sync after a (re)connect ──────────────
+  // The socket was down while messages were persisted, so they were never
+  // pushed. Re-fetch the page and merge by id rather than replace, so anything
+  // that did arrive over the socket while the fetch was in flight is kept.
+  const resyncMessages = useCallback(async () => {
+    if (mountedConvRef.current !== conversationId) return
+    try {
+      const res = await fetch(`/api/conversations/${conversationId}/messages?limit=50`, {
+        cache: 'no-store',
+      })
+      if (mountedConvRef.current !== conversationId) return
+      const json = (await res.json()) as MessagesResponse
+      if (json.error) return
+      const page = json.messages ?? []
+      setMessages((prev) => {
+        const next = mergeMessages(prev, page)
+        seenIdsRef.current = new Set(next.map((m) => m.id))
+        return next
+      })
+    } catch {
+      /* the next reconnect or fetch will retry */
+    }
+  }, [conversationId])
+
   // Mark as read on open / when new messages arrive while window is open.
+  //
+  // `socketMarkReadRef` is read through a ref so this callback does not have to
+  // depend on the socket instance, which would otherwise churn its identity.
   const markRead = useCallback(async () => {
     try {
       await apiPost(`/api/conversations/${conversationId}/read`)
       onConversationChanged()
       // Tell other members via socket so they can clear their unread badge
-      socketMarkReadRef.current?.(conversationId, memberIdsRef.current)
+      socketMarkReadRef.current?.(conversationId)
     } catch {
       /* ignore */
     }
   }, [conversationId, onConversationChanged])
 
+  const unreadCount = convMeta?.unreadCount ?? 0
   useEffect(() => {
-    if (!loading && messages.length >= 0) markRead()
-  }, [loading, conversationId, markRead])
+    // Only when there is actually something to clear. Firing unconditionally
+    // meant every state change re-POSTed /read, which refreshed the list,
+    // which re-rendered — an unbounded request loop on every page visit.
+    if (loading || unreadCount === 0) return
+    markRead()
+  }, [loading, unreadCount, conversationId, markRead])
 
   // Auto-scroll to bottom on new messages
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages.length])
 
-  // ── Recipient ids for socket fan-out ────────
-  const memberIdsRef = useRef<string[]>([])
-  useEffect(() => {
-    memberIdsRef.current = members.map((m) => m.id)
-  }, [members])
-
   // ── Socket connection ────────────────────────
-  const onMessage = useCallback((payload: IncomingMessagePayload) => {
-    if (payload.conversationId !== mountedConvRef.current) {
+  // Messages are persisted over HTTP and pushed by the server, so there is no
+  // `sendMessage` here — the socket only delivers inbound events.
+  const onMessage = useCallback((event: ChatMessageEvent) => {
+    if (event.conversationId !== mountedConvRef.current) {
       // Different conversation → just trigger a list refresh for unread badges
       onConversationChanged()
       return
     }
-    setMessages((prev) => {
-      if (prev.some((m) => m.id === payload.message.id)) return prev
-      return [...prev, payload.message]
-    })
+    const message = event.message as ChatMessage
+    if (seenIdsRef.current.has(message.id)) return // re-delivery after reconnect
+    seenIdsRef.current.add(message.id)
+    setMessages((prev) => mergeMessages(prev, [message]))
     // Mark read since user is viewing this conversation
     markRead()
   }, [markRead, onConversationChanged])
 
-  const onTyping = useCallback((payload: { conversationId: string; userId: string; isTyping: boolean }) => {
-    if (payload.conversationId !== mountedConvRef.current) return
+  const onTyping = useCallback((event: ChatTypingEvent) => {
+    if (event.conversationId !== mountedConvRef.current) return
     setTypingUserIds((prev) => {
       const next = new Set(prev)
-      if (payload.isTyping) next.add(payload.userId)
-      else next.delete(payload.userId)
+      if (event.typing) next.add(event.userId)
+      else next.delete(event.userId)
       return next
     })
   }, [])
 
-  const onRead = useCallback((_payload: { conversationId: string }) => {
+  const onRead = useCallback((_event: ChatReadEvent) => {
     // Could clear a "delivered" indicator — currently no-op
   }, [])
 
-  const { connected, sendMessage, sendTyping, markRead: socketMarkRead } = useChatSocket({
-    userId: user?.id,
-    username: user?.username,
-    callbacks: { onMessage, onTyping, onRead },
+  const { connected, sendTyping, markRead: socketMarkRead } = useChatSocket({
+    userId: user?.id ?? null,
+    username: user?.username ?? '',
+    onMessage,
+    onTyping,
+    onRead,
+    onReconnect: resyncMessages,
+    // A Durable Object is not loaded by `next dev`, and some networks block
+    // WebSockets. Poll while the socket is down so the view still stays current.
+    onFallbackPoll: resyncMessages,
+    fallbackPollMs: 5000,
   })
 
   // Stash socket helpers in refs so markRead above can call them without
-  // creating a stale-closure dependency cycle.
+  // creating a stale-closure dependency cycle. Assigned in an effect, not
+  // during render — a render-phase write is a side effect React may run twice
+  // or discard entirely.
   const socketMarkReadRef = useRef<typeof socketMarkRead | null>(null)
-  socketMarkReadRef.current = socketMarkRead
+  useEffect(() => {
+    socketMarkReadRef.current = socketMarkRead
+  }, [socketMarkRead])
 
   // ── Send message ─────────────────────────────
   const handleSend = async () => {
@@ -569,11 +680,12 @@ function ChatWindow({
         `/api/conversations/${conversationId}/messages`,
         { content }
       )
-      setMessages((prev) => [...prev, res.message])
-      // Relay to other members via socket
-      sendMessage(conversationId, res.message, memberIdsRef.current)
+      // The POST reply is the sender's own copy; registering the id up front
+      // keeps the socket echo (and any later re-fetch) from duplicating it.
+      seenIdsRef.current.add(res.message.id)
+      setMessages((prev) => mergeMessages(prev, [res.message]))
       // Stop typing indicator on our side
-      sendTyping(conversationId, memberIdsRef.current, false)
+      sendTyping(conversationId, false)
       onConversationChanged()
       // Scroll to bottom after send
       requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }))
@@ -586,16 +698,23 @@ function ChatWindow({
   }
 
   // ── Typing indicator ────────────────────────
-  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const onDraftChange = (v: string) => {
     setDraft(v)
     if (!connected) return
-    sendTyping(conversationId, memberIdsRef.current, true)
+    sendTyping(conversationId, true)
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
     typingTimeoutRef.current = setTimeout(() => {
-      sendTyping(conversationId, memberIdsRef.current, false)
+      sendTyping(conversationId, false)
     }, 2000)
   }
+
+  // Don't leave a pending typing timeout running after unmount.
+  useEffect(() => {
+    return () => {
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
+    }
+  }, [])
 
   // ── Keyboard ────────────────────────────────
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -733,7 +852,7 @@ function ChatHeader({
   onBack: () => void
   connected: boolean
 }) {
-  const { navigate } = useViewStore()
+  const navigate = useViewStore((s) => s.navigate)
   const other = conversation?.members?.[0]
 
   return (
@@ -811,7 +930,7 @@ function MessageBubble({
   showSender: boolean
   sender?: AuthorDTO
 }) {
-  const { navigate } = useViewStore()
+  const navigate = useViewStore((s) => s.navigate)
   const time = new Date(message.createdAt).toLocaleTimeString('id-ID', {
     hour: '2-digit',
     minute: '2-digit',

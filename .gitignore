@@ -32,6 +32,31 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+
+# Cloudflare Workers / D1 / R2
+.wrangler/
+.open-next/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+cloudflare-env.d.ts
+
+# local-only Windows helpers; each one hardcodes an absolute path and just
+# wraps a package.json script, so they are per-machine scratch, not project code
+scripts/*.cmd
+
+# scratch logs written by those helpers
+.build-next.log
+.build-opennext.log
+.tsc.log
+.tsc-app.log
+.tsc-worker.log
+.seed.log
+.verify.log
+.verify-remote.log
+.d1-check.log
+.tail.log
 
 # vercel
 .vercel

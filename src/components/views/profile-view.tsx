@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import Link from 'next/link'
 import {
   CalendarDays,
@@ -53,6 +53,7 @@ function gradientFor(username: string) {
 export function ProfileView() {
   const profileUsername = useViewStore((s) => s.profileUsername)
   const navigate = useViewStore((s) => s.navigate)
+  const setConversation = useViewStore((s) => s.setConversation)
   const currentUser = useAuthStore((s) => s.user)
 
   const {
@@ -69,6 +70,7 @@ export function ProfileView() {
   const [tab, setTab] = useState<Tab>('posts')
   const [editOpen, setEditOpen] = useState(false)
   const [followPending, setFollowPending] = useState(false)
+  const [messagePending, setMessagePending] = useState(false)
 
   // Reset tab when switching profile
   useEffect(() => {
@@ -103,6 +105,25 @@ export function ProfileView() {
       toast.error(e.message || 'Gagal mengubah status follow')
     } finally {
       setFollowPending(false)
+    }
+  }
+
+  // Opens (or reuses) the private thread with this profile before navigating —
+  // previously it only navigated, so no conversation was selected and the
+  // messages view opened on an empty state.
+  const handleMessage = async () => {
+    if (!profile || profile.isSelf) return
+    setMessagePending(true)
+    try {
+      const res = await apiPost<{ conversation: { id: string } }>('/api/conversations', {
+        participantId: profile.id,
+      })
+      setConversation(res.conversation.id)
+      navigate('messages', { conversationId: res.conversation.id })
+    } catch (e: any) {
+      toast.error(e.message || 'Gagal membuka percakapan')
+    } finally {
+      setMessagePending(false)
     }
   }
 
@@ -200,10 +221,15 @@ export function ProfileView() {
                 <Button
                   variant="secondary"
                   className="rounded-full font-semibold"
-                  onClick={() => navigate('messages')}
+                  onClick={handleMessage}
+                  disabled={messagePending}
                   title="Pesan"
                 >
-                  <MessageCircle className="h-4 w-4" />
+                  {messagePending ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <MessageCircle className="h-4 w-4" />
+                  )}
                   <span className="hidden sm:inline ml-1.5">Pesan</span>
                 </Button>
                 <Button
@@ -340,6 +366,10 @@ function ProfilePostsList({ username, tab }: { username: string; tab: Tab }) {
   const [cursor, setCursor] = useState<string | null>(null)
   const [hasMore, setHasMore] = useState(false)
 
+  // Set by the effect cleanup so a slow response for a profile/tab the user has
+  // already left cannot overwrite the current one. Read by `fetchFirst`.
+  const ignoreRef = useRef(false)
+
   const fetchFirst = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -352,18 +382,26 @@ function ProfilePostsList({ username, tab }: { username: string; tab: Tab }) {
         throw new Error(e.error || `HTTP ${res.status}`)
       }
       const data = await res.json()
-      setPosts(data.posts)
-      setCursor(data.nextCursor)
+      if (ignoreRef.current) return
+      setPosts(data.posts ?? [])
+      setCursor(data.nextCursor ?? null)
       setHasMore(!!data.nextCursor)
     } catch (e: any) {
+      if (ignoreRef.current) return
       setError(e.message || 'Gagal memuat post')
     } finally {
-      setLoading(false)
+      if (!ignoreRef.current) setLoading(false)
     }
   }, [username, tab])
 
   useEffect(() => {
-    fetchFirst()
+    ignoreRef.current = false
+    fetchFirst().catch(() => {
+      /* handled inside fetchFirst */
+    })
+    return () => {
+      ignoreRef.current = true
+    }
   }, [fetchFirst])
 
   const loadMore = async () => {
@@ -373,9 +411,15 @@ function ProfilePostsList({ username, tab }: { username: string; tab: Tab }) {
       const res = await fetch(
         `/api/profiles/${encodeURIComponent(username)}/posts?tab=${tab}&limit=20&cursor=${cursor}`
       )
+      // An error body has no `posts`, so spreading it used to throw
+      // `[...prev, ...undefined]` and unmount the whole view.
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}))
+        throw new Error(e.error || `HTTP ${res.status}`)
+      }
       const data = await res.json()
-      setPosts((prev) => [...prev, ...data.posts])
-      setCursor(data.nextCursor)
+      setPosts((prev) => [...prev, ...(data.posts ?? [])])
+      setCursor(data.nextCursor ?? null)
       setHasMore(!!data.nextCursor)
     } catch {
       toast.error('Gagal memuat lebih banyak post')

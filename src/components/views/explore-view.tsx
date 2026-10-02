@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Search, TrendingUp, Sparkles, Hash, Users, X, UserPlus, UserCheck } from 'lucide-react'
 import { useViewStore } from '@/stores/app-store'
 import { useApi, apiPost, apiDelete } from '@/lib/hooks'
@@ -28,7 +28,8 @@ interface SearchResult {
 }
 
 export function ExploreView() {
-  const { searchQuery, setSearchQuery } = useViewStore()
+  const searchQuery = useViewStore((s) => s.searchQuery)
+  const setSearchQuery = useViewStore((s) => s.setSearchQuery)
   const hasSearch = searchQuery.trim().length > 0
 
   return (
@@ -61,7 +62,8 @@ export function ExploreView() {
 // ── Default explore view (no search) ───────────
 function ExploreHome() {
   const { data, loading, error, refetch } = useApi<ExploreData>('/api/explore', {})
-  const { navigate, setSearchQuery } = useViewStore()
+  const navigate = useViewStore((s) => s.navigate)
+  const setSearchQuery = useViewStore((s) => s.setSearchQuery)
 
   if (loading) return <FeedSkeleton count={4} />
   if (error) return <ErrorState message={error} onRetry={refetch} />
@@ -135,9 +137,14 @@ function ExploreHome() {
 }
 
 function SuggestedUserCard({ user: u }: { user: ProfileDTO }) {
-  const { navigate } = useViewStore()
+  const navigate = useViewStore((s) => s.navigate)
   const [following, setFollowing] = useState(u.isFollowing)
   const [busy, setBusy] = useState(false)
+
+  // Re-sync when the same user comes back from a refetch with a new flag.
+  useEffect(() => {
+    setFollowing(u.isFollowing)
+  }, [u.isFollowing])
 
   const toggleFollow = async () => {
     setBusy(true)
@@ -199,7 +206,7 @@ function SuggestedUserCard({ user: u }: { user: ProfileDTO }) {
 
 // ── Search results view ─────────────────────────
 function SearchResults({ query }: { query: string }) {
-  const { navigate } = useViewStore()
+  const navigate = useViewStore((s) => s.navigate)
   const [activeTab, setActiveTab] = useState<'posts' | 'users' | 'communities'>('posts')
   const [debounced, setDebounced] = useState(query)
   const [loading, setLoading] = useState(false)
@@ -212,31 +219,37 @@ function SearchResults({ query }: { query: string }) {
     return () => clearTimeout(t)
   }, [query])
 
-  // Fetch on debounced change — wrapped in useCallback so the effect body
-  // only contains the function call (avoids cascading-render warning).
+  // Fetch on debounced change. `runSearch` takes the live flag from the effect
+  // cleanup, so a slow response for an older query cannot overwrite the results
+  // for the current one.
+  const ignoreRef = useRef(false)
+
   const runSearch = useCallback(async (q: string) => {
     setLoading(true)
     setError(null)
     try {
       const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`)
+      if (ignoreRef.current) return
       const json = await r.json()
+      if (ignoreRef.current) return
       if (!json || json.error) throw new Error(json?.error || 'Gagal mencari')
       setResults(json)
     } catch (e: any) {
+      if (ignoreRef.current) return
       setError(e.message)
     } finally {
-      setLoading(false)
+      if (!ignoreRef.current) setLoading(false)
     }
   }, [])
 
   useEffect(() => {
+    ignoreRef.current = false
     if (!debounced.trim()) return
-    let cancelled = false
     runSearch(debounced).catch(() => {
       /* handled inside runSearch */
     })
     return () => {
-      cancelled = true
+      ignoreRef.current = true
     }
   }, [debounced, runSearch])
 
@@ -330,6 +343,11 @@ function UserResultRow({ user: u, onOpen }: { user: ProfileDTO; onOpen: () => vo
   const [following, setFollowing] = useState(u.isFollowing)
   const [busy, setBusy] = useState(false)
 
+  // Re-sync when the same user comes back from a refetch with a new flag.
+  useEffect(() => {
+    setFollowing(u.isFollowing)
+  }, [u.isFollowing])
+
   const toggleFollow = async () => {
     setBusy(true)
     const was = following
@@ -389,6 +407,12 @@ function CommunityMiniCard({ community: c }: { community: CommunityDTO }) {
   const [isMember, setIsMember] = useState(c.isMember)
   const [membersCount, setMembersCount] = useState(c.membersCount)
   const [busy, setBusy] = useState(false)
+
+  // Re-sync when the same community comes back from a refetch.
+  useEffect(() => {
+    setIsMember(c.isMember)
+    setMembersCount(c.membersCount)
+  }, [c.isMember, c.membersCount])
 
   const toggleJoin = async () => {
     setBusy(true)

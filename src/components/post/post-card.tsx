@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useOptimistic, useTransition } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Heart,
   MessageCircle,
@@ -12,17 +12,13 @@ import {
   Flag,
   BarChart3,
 } from 'lucide-react'
-import Link from 'next/link'
 import { cn } from '@/lib/utils'
 import { formatCount, timeAgo } from '@/lib/api'
 import { UserAvatar } from '@/components/user-avatar'
-import { Button } from '@/components/ui/button'
-import { Textarea } from '@/components/ui/textarea'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { toast } from 'sonner'
@@ -40,28 +36,45 @@ interface PostCardProps {
 export function PostCard({ post, onReply, onDelete, variant = 'default' }: PostCardProps) {
   const user = useAuthStore((s) => s.user)
   const navigate = useViewStore((s) => s.navigate)
-  const [local, setLocal] = useOptimistic(post, (state, next: Partial<PostDTO>) => ({ ...state, ...next }))
-  const [, startTransition] = useTransition()
-
+  // Plain local state seeded from `post`.
+  //
+  // `useOptimistic` could never work here: the optimistic value was discarded as
+  // soon as the enclosing transition settled and `post` was never updated, so a
+  // successful like/repost/bookmark visibly snapped back. It also made the error
+  // path a no-op, because it restored `local.*` — which *was* the optimistic
+  // value. Now the server response reconciles the real counts and a failure rolls
+  // back to the untouched `post.*` counts.
+  const [local, setLocal] = useState(post)
   const [liking, setLiking] = useState(false)
+
+  useEffect(() => {
+    setLocal(post)
+  }, [post])
 
   const toggleLike = async () => {
     if (!user) {
       toast.error('Login dulu untuk like')
       return
     }
+    if (liking) return
     setLiking(true)
     const wasLiked = local.liked
-    startTransition(() => {
-      setLocal({ liked: !wasLiked, likeCount: local.likeCount + (wasLiked ? -1 : 1) })
-    })
+    setLocal((prev) => ({
+      ...prev,
+      liked: !wasLiked,
+      likeCount: Math.max(0, prev.likeCount + (wasLiked ? -1 : 1)),
+    }))
     try {
       const res = await fetch(`/api/posts/${post.id}/like`, { method: wasLiked ? 'DELETE' : 'POST' })
       if (!res.ok) throw new Error()
+      const data = await res.json().catch(() => null)
+      setLocal((prev) => ({
+        ...prev,
+        liked: typeof data?.liked === 'boolean' ? data.liked : prev.liked,
+        likeCount: typeof data?.likeCount === 'number' ? data.likeCount : prev.likeCount,
+      }))
     } catch {
-      startTransition(() => {
-        setLocal({ liked: wasLiked, likeCount: local.likeCount })
-      })
+      setLocal((prev) => ({ ...prev, liked: wasLiked, likeCount: post.likeCount }))
       toast.error('Gagal update like')
     } finally {
       setLiking(false)
@@ -74,17 +87,30 @@ export function PostCard({ post, onReply, onDelete, variant = 'default' }: PostC
       return
     }
     const wasBookmarked = local.bookmarked
-    startTransition(() => {
-      setLocal({ bookmarked: !wasBookmarked, bookmarkCount: local.bookmarkCount + (wasBookmarked ? -1 : 1) })
-    })
+    setLocal((prev) => ({
+      ...prev,
+      bookmarked: !wasBookmarked,
+      bookmarkCount: Math.max(0, prev.bookmarkCount + (wasBookmarked ? -1 : 1)),
+    }))
     try {
-      const res = await fetch(`/api/posts/${post.id}/bookmark`, { method: wasBookmarked ? 'DELETE' : 'POST' })
+      const res = await fetch(`/api/posts/${post.id}/bookmark`, {
+        method: wasBookmarked ? 'DELETE' : 'POST',
+      })
       if (!res.ok) throw new Error()
+      const data = await res.json().catch(() => null)
+      setLocal((prev) => ({
+        ...prev,
+        bookmarked: typeof data?.bookmarked === 'boolean' ? data.bookmarked : prev.bookmarked,
+        bookmarkCount:
+          typeof data?.bookmarkCount === 'number' ? data.bookmarkCount : prev.bookmarkCount,
+      }))
       toast.success(wasBookmarked ? 'Dihapus dari bookmark' : 'Disimpan ke bookmark')
     } catch {
-      startTransition(() => {
-        setLocal({ bookmarked: wasBookmarked, bookmarkCount: local.bookmarkCount })
-      })
+      setLocal((prev) => ({
+        ...prev,
+        bookmarked: wasBookmarked,
+        bookmarkCount: post.bookmarkCount,
+      }))
       toast.error('Gagal update bookmark')
     }
   }
@@ -95,22 +121,33 @@ export function PostCard({ post, onReply, onDelete, variant = 'default' }: PostC
       return
     }
     const wasReposted = local.reposted
-    startTransition(() => {
-      setLocal({ reposted: !wasReposted, repostCount: local.repostCount + (wasReposted ? -1 : 1) })
-    })
+    setLocal((prev) => ({
+      ...prev,
+      reposted: !wasReposted,
+      repostCount: Math.max(0, prev.repostCount + (wasReposted ? -1 : 1)),
+    }))
     try {
-      const res = await fetch(`/api/posts/${post.id}/repost`, { method: wasReposted ? 'DELETE' : 'POST' })
+      const res = await fetch(`/api/posts/${post.id}/repost`, {
+        method: wasReposted ? 'DELETE' : 'POST',
+      })
       if (!res.ok) throw new Error()
+      const data = await res.json().catch(() => null)
+      setLocal((prev) => ({
+        ...prev,
+        reposted: typeof data?.reposted === 'boolean' ? data.reposted : prev.reposted,
+        repostCount:
+          typeof data?.repostCount === 'number' ? data.repostCount : prev.repostCount,
+      }))
       toast.success(wasReposted ? 'Repost dibatalkan' : 'Direpost!')
     } catch {
-      startTransition(() => {
-        setLocal({ reposted: wasReposted, repostCount: local.repostCount })
-      })
+      setLocal((prev) => ({ ...prev, reposted: wasReposted, repostCount: post.repostCount }))
       toast.error('Gagal repost')
     }
   }
 
   const share = async () => {
+    // Read back by `src/app/page.tsx`, which turns `?post=<id>` into a
+    // post-detail navigation and then cleans the query string.
     const url = `${window.location.origin}/?post=${post.id}`
     try {
       if (navigator.share) {
@@ -320,11 +357,13 @@ export function PostCard({ post, onReply, onDelete, variant = 'default' }: PostC
               disabled={liking}
               label="Like"
             />
+            {/* There is no view counter anywhere in the API, so this reports the
+                real engagement totals instead of inventing a number. */}
             <ActionButton
               icon={BarChart3}
-              count={local.likeCount + local.repostCount}
+              count={local.likeCount + local.repostCount + local.commentCount}
               onClick={(e) => e.stopPropagation()}
-              label="Views"
+              label="Interaksi"
               hideOnMobile
             />
             <div className="flex items-center">

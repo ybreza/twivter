@@ -1,78 +1,32 @@
-import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
-import { getCurrentUser } from '@/lib/auth'
-import { ok, unauthorized, withErrorHandler } from '@/lib/api'
-import { serializeNotification } from '@/lib/serialize'
+import { ok, withErrorHandler } from '@/lib/api'
+import { requireUser } from '@/lib/auth'
+import { parseLimit } from '@/lib/db'
+import { listNotifications, unreadNotificationCount } from '@/lib/data/notifications'
 
-// GET /api/notifications — list notifications (paginated by cursor)
-// GET /api/notifications?unread=1 — return only unread count
+// GET /api/notifications?cursor=<id>&limit=30
+//   → { notifications: NotificationDTO[], unreadCount: number, nextCursor: string | null }
+// GET /api/notifications?unread=1
+//   → { unreadCount: number }
 //
-// NOTE: The Prisma schema currently defines `Notification.postId` as a plain
-// String? (no relation). The shared `serializeNotification` helper expects
-// `n.post` to be populated, so we fetch notifications first, batch-fetch the
-// referenced posts, then merge them in before serializing.
-export const GET = withErrorHandler(async (req: NextRequest) => {
-  const user = await getCurrentUser()
-  if (!user) return unauthorized()
-
+// The repository LEFT JOINs `Post`, so a notification whose post was deleted now
+// serialises with `post: null`. Previously the serializer dereferenced that
+// post unconditionally and the whole feed returned 500 for that user forever.
+export const GET = withErrorHandler(async (req) => {
+  const user = await requireUser()
   const { searchParams } = new URL(req.url)
-  const onlyUnreadCount = searchParams.get('unread') === '1'
 
-  const unreadCount = await db.notification.count({
-    where: { userId: user.id, read: false },
-  })
-
-  if (onlyUnreadCount) {
-    return ok({ unreadCount })
+  if (searchParams.get('unread') === '1') {
+    return ok({ unreadCount: await unreadNotificationCount(user.id) })
   }
 
-  const limit = Math.min(parseInt(searchParams.get('limit') || '30'), 50)
-  const cursor = searchParams.get('cursor')
+  // `?limit=0` used to reach the ORM as `0 + 1` and `?limit=abc` as `NaN`.
+  const limit = parseLimit(searchParams.get('limit'), 30, 50)
+  const cursor = searchParams.get('cursor') || null
 
-  const notifications = await db.notification.findMany({
-    where: { userId: user.id },
-    include: {
-      actor: {
-        select: {
-          id: true,
-          username: true,
-          displayName: true,
-          avatarUrl: true,
-          verified: true,
-        },
-      },
-    },
-    orderBy: { createdAt: 'desc' },
-    take: limit + 1,
-    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-  })
+  const [{ notifications, nextCursor }, unreadCount] = await Promise.all([
+    listNotifications(user.id, { limit, cursor }),
+    unreadNotificationCount(user.id),
+  ])
 
-  const hasMore = notifications.length > limit
-  const items = hasMore ? notifications.slice(0, limit) : notifications
-
-  // Batch-fetch posts referenced by postId
-  const postIds = Array.from(
-    new Set(items.map((n) => n.postId).filter((p): p is string => !!p))
-  )
-  const posts = postIds.length > 0
-    ? await db.post.findMany({
-        where: { id: { in: postIds } },
-        select: { id: true, content: true },
-      })
-    : []
-  const postMap = new Map(posts.map((p) => [p.id, p]))
-
-  // Attach `post` to each notification so serializeNotification works
-  const withPosts = items.map((n) => ({
-    ...n,
-    post: n.postId ? postMap.get(n.postId) ?? null : null,
-  }))
-
-  const serialized = await Promise.all(withPosts.map((n) => serializeNotification(n)))
-
-  return ok({
-    notifications: serialized,
-    unreadCount,
-    nextCursor: hasMore ? items[items.length - 1].id : null,
-  })
+  return ok({ notifications, unreadCount, nextCursor })
 })
