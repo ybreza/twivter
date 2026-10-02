@@ -3,7 +3,7 @@
 import { useState, FormEvent } from 'react'
 import { motion } from 'framer-motion'
 import { toast } from 'sonner'
-import { Eye, EyeOff, Loader2, ArrowLeft, Mail, Lock, Sparkles } from 'lucide-react'
+import { Eye, EyeOff, Loader2, ArrowLeft, Mail, Lock } from 'lucide-react'
 import { TwivterLogo, TwivterWordmark } from '@/components/twivter-logo'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -181,16 +181,6 @@ export function LoginView() {
                     'Masuk'
                   )}
                 </Button>
-
-                {/* Demo hint */}
-                <div className="flex items-start gap-2 text-xs text-muted-foreground bg-muted/40 rounded-lg p-3">
-                  <Sparkles className="h-3.5 w-3.5 mt-0.5 shrink-0 text-primary" />
-                  <div>
-                    <span className="font-medium">Akun demo:</span>{' '}
-                    <code className="font-mono text-foreground">yowanda@twivter.com</code> /{' '}
-                    <code className="font-mono text-foreground">password123</code>
-                  </div>
-                </div>
               </form>
             </CardContent>
           </Card>
